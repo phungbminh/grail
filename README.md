@@ -30,16 +30,18 @@ This project requires **Python 3.11** for compatibility with DGL 2.5.0. Python 3
    For **macOS**:
    ```bash
    pip install --upgrade pip
-   pip install -r requirements.txt
+   pip install -r requirements-mac.txt
+   # Or use the generic requirements.txt (same as mac)
+   # pip install -r requirements.txt
    ```
 
    For **Linux**:
    ```bash
    pip install --upgrade pip
-   # Install DGL with special wheel repo
-   pip install dgl -f https://data.dgl.ai/wheels/torch-2.4/repo.html
-   # Install remaining dependencies
-   pip install -r requirements.txt
+   # Install DGL first with special wheel repo
+   pip install dgl==2.2.1 -f https://data.dgl.ai/wheels/torch-2.4/repo.html
+   # Then install remaining dependencies
+   pip install -r requirements-linux.txt
    ```
 
 4. **For development** (optional)
