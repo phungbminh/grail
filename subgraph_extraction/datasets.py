@@ -10,7 +10,6 @@ import dgl
 from utils.graph_utils import ssp_multigraph_to_dgl, incidence_matrix
 from utils.data_utils import process_files, save_to_file, plot_rel_dist
 from .graph_sampler import *
-import pdb
 
 
 def generate_subgraph_datasets(params, splits=['train', 'valid'], saved_relation2id=None, max_label_value=None):
