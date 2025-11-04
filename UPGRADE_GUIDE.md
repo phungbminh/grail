@@ -32,8 +32,9 @@ This guide helps you upgrade the GRAIL (Graph Representation And Inductive Learn
 | Component | Old Version | New Version | Notes |
 |-----------|-------------|-------------|-------|
 | **Python** | 3.10 or system | **3.11.10** | Required for DGL compatibility |
-| **DGL** | 2.1.0 | **2.5.0** | Latest stable, Python 3.11 max |
-| **PyTorch** | 2.2.0 | **2.7.0** | Latest stable release |
+| **DGL** | 2.1.0 | **2.2.1** | Stable version, Python 3.11 max |
+| **PyTorch** | 2.2.0 | **2.2.1** | Stable release |
+| **torchvision** | 0.17.0 | **0.17.1** | Compatible with PyTorch 2.2.1 |
 | **NetworkX** | 3.0+ | **3.5+** | Latest compatible |
 | **scikit-learn** | unversioned | **1.6.0+** | Latest stable |
 | **tqdm** | 4.43.0 | **4.67.0+** | 4+ years of updates |
@@ -50,7 +51,7 @@ This guide helps you upgrade the GRAIL (Graph Representation And Inductive Learn
 
 ### Why Python 3.11 (Not 3.13)?
 
-**DGL 2.5.0 does not support Python 3.13 as of 2025.** Python 3.11 is the latest version fully compatible with DGL. This guide will be updated when DGL adds Python 3.13 support.
+**DGL 2.2.1 does not support Python 3.13 as of 2025.** Python 3.11 is the latest version fully compatible with DGL. This guide will be updated when DGL adds Python 3.13 support.
 
 ## Prerequisites
 
@@ -213,19 +214,15 @@ Dependencies must be installed in a specific order to ensure compatibility:
 
 PyTorch is the foundation that DGL depends on. Choose based on your system:
 
-**CPU-Only (Default):**
+**macOS:**
 ```bash
-pip install torch==2.7.0 torchvision==0.19.0
+pip install torch==2.2.1 torchvision==0.17.1
 ```
 
-**GPU with CUDA 12.1:**
+**Linux (CPU or GPU):**
 ```bash
-pip install torch==2.7.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
-```
-
-**GPU with CUDA 12.4:**
-```bash
-pip install torch==2.7.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu124
+pip install torch==2.2.1 torchvision==0.17.1
+# Note: GPU support depends on your CUDA installation
 ```
 
 **Verify PyTorch installation:**
@@ -236,22 +233,19 @@ python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 
 #### 3b. Install DGL
 
-DGL requires special wheel repositories based on PyTorch and CUDA versions:
+DGL installation differs by platform:
 
-**CPU-Only:**
+**macOS:**
 ```bash
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/repo.html
+pip install dgl==2.2.1
 ```
 
-**GPU with CUDA 12.1:**
+**Linux:**
 ```bash
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/cu121/repo.html
+pip install dgl==2.2.1 -f https://data.dgl.ai/wheels/torch-2.4/repo.html
 ```
 
-**GPU with CUDA 12.4:**
-```bash
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/cu124/repo.html
-```
+**Note**: It's recommended to use the platform-specific requirements files (see step 3c).
 
 **Verify DGL installation:**
 ```bash
@@ -259,19 +253,24 @@ python -c "import dgl; print(f'DGL {dgl.__version__}')"
 python -c "import dgl; print(f'DGL backend: {dgl.backend.backend_name}')"
 ```
 
-#### 3c. Install Remaining Production Dependencies
+#### 3c. Install Platform-Specific Dependencies (Recommended)
 
+Instead of installing packages individually, use the platform-specific requirements file:
+
+**macOS:**
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-mac.txt
 ```
 
-This installs:
-- networkx (graph algorithms)
-- scikit-learn (machine learning utilities)
-- tqdm (progress bars)
-- lmdb (database)
-- ogb (Open Graph Benchmark datasets)
-- numpy (scientific computing)
+**Linux:**
+```bash
+pip install -r requirements-linux.txt
+```
+
+These files include all necessary dependencies:
+- torch==2.2.1, torchvision==0.17.1
+- dgl==2.2.1 (with correct installation method for the platform)
+- networkx, scikit-learn, tqdm, lmdb, ogb, numpy
 
 #### 3d. Install Development Tools (Optional but Recommended)
 
@@ -417,30 +416,28 @@ python -c "import torch; print(f'PyTorch CUDA: {torch.version.cuda}')"
 
 #### CUDA Compatibility Matrix
 
-| CUDA Version | PyTorch 2.7.0 | DGL 2.5.0 | Installation Command Suffix |
-|--------------|---------------|-----------|----------------------------|
-| 12.1 | ✅ Supported | ✅ Supported | `cu121` |
-| 12.4 | ✅ Supported | ✅ Supported | `cu124` |
-| 11.8 | ⚠️  Deprecated | ⚠️  Use CPU | `cu118` (not recommended) |
+| CUDA Version | PyTorch 2.2.1 | DGL 2.2.1 | Notes |
+|--------------|---------------|-----------|-------|
+| 12.1 | ✅ Supported | ✅ Supported | Recommended for newer GPUs |
+| 11.8 | ✅ Supported | ✅ Supported | Supported for older GPUs |
 
 #### Installing CUDA-Enabled Packages
 
-**Full GPU Installation (CUDA 12.1):**
+**GPU Installation (Linux):**
 ```bash
 # Uninstall any existing versions
 pip uninstall -y torch torchvision dgl
 
-# Install PyTorch with CUDA 12.1
-pip install torch==2.7.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
-
-# Install DGL with CUDA 12.1
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/cu121/repo.html
+# Install using Linux requirements file
+pip install -r requirements-linux.txt
 
 # Verify GPU is available
 python -c "import torch; print(f'CUDA Available: {torch.cuda.is_available()}')"
 python -c "import torch; print(f'CUDA Devices: {torch.cuda.device_count()}')"
 python -c "import torch; print(f'Current Device: {torch.cuda.get_device_name(0)}')"
 ```
+
+**Note**: PyTorch 2.2.1 and DGL 2.2.1 work with CUDA 11.8 or 12.1. The Linux requirements file handles the correct installation.
 
 #### Troubleshooting GPU Issues
 
@@ -458,10 +455,12 @@ python -c "import torch; print(f'Current Device: {torch.cuda.get_device_name(0)}
    nvcc --version  # Compare versions
    ```
 
-3. **Reinstall with Correct CUDA Version**:
+3. **Reinstall with Correct Version**:
    ```bash
-   pip uninstall torch torchvision
-   pip install torch==2.7.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
+   pip uninstall torch torchvision dgl
+   pip install -r requirements-linux.txt  # For Linux
+   # or
+   pip install -r requirements-mac.txt    # For macOS
    ```
 
 ## Verification Steps
@@ -567,29 +566,33 @@ mypy . --ignore-missing-imports
 
 ### Common Installation Issues
 
-#### Issue 1: "No matching distribution found for dgl==2.5.0"
+#### Issue 1: "No matching distribution found for dgl==2.2.1"
 
-**Cause**: DGL wheel not found for your Python/CUDA combination.
+**Cause**: DGL installation requires platform-specific method.
 
 **Solution**:
 ```bash
 # Verify Python version is exactly 3.11.x
 python --version
 
-# Use the correct wheel repository URL
-# CPU:
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/repo.html
+# Use platform-specific requirements file
+# macOS:
+pip install -r requirements-mac.txt
 
-# CUDA 12.1:
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/cu121/repo.html
+# Linux:
+pip install -r requirements-linux.txt
 
-# If still failing, check available wheels:
-curl -s https://data.dgl.ai/wheels/torch-2.7/repo.html | grep "dgl-2.5.0"
+# Or install DGL directly:
+# macOS:
+pip install dgl==2.2.1
+
+# Linux:
+pip install dgl==2.2.1 -f https://data.dgl.ai/wheels/torch-2.4/repo.html
 ```
 
 #### Issue 2: "ImportError: cannot import name 'mean_nodes' from 'dgl'"
 
-**Cause**: DGL API has changed in version 2.5.0.
+**Cause**: DGL API has changed between versions.
 
 **Solution**:
 ```python
@@ -597,7 +600,7 @@ curl -s https://data.dgl.ai/wheels/torch-2.7/repo.html | grep "dgl-2.5.0"
 from dgl import mean_nodes
 result = mean_nodes(g, 'feat')
 
-# New API (DGL 2.5+):
+# New API (DGL 2.2+):
 import dgl
 result = dgl.readout_nodes(g, 'feat', op='mean')
 # Or if mean_nodes still exists:
@@ -613,9 +616,12 @@ result = dgl.mean_nodes(g, 'feat')
 # Completely uninstall
 pip uninstall -y torch torchvision dgl
 
-# Reinstall with matching CUDA versions (example: CUDA 12.1)
-pip install torch==2.7.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/cu121/repo.html
+# Reinstall using platform requirements
+# For Linux (handles CUDA properly):
+pip install -r requirements-linux.txt
+
+# For macOS:
+pip install -r requirements-mac.txt
 
 # Verify CUDA versions match
 python -c "import torch; print(f'PyTorch CUDA: {torch.version.cuda}')"
@@ -674,10 +680,12 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 pip uninstall -r requirements.txt -y
 pip uninstall -r requirements-dev.txt -y
 
-# Install in order
-pip install torch==2.7.0 torchvision==0.19.0
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/repo.html
-pip install -r requirements.txt
+# Install in order using platform-specific requirements
+# For macOS:
+pip install -r requirements-mac.txt
+# For Linux:
+pip install -r requirements-linux.txt
+# Then dev dependencies:
 pip install -r requirements-dev.txt
 ```
 
@@ -849,21 +857,21 @@ except* ValueError as eg:
 
 ### Library Updates
 
-#### PyTorch 2.7.0
+#### PyTorch 2.2.1
 
-- Improved `torch.compile` performance
-- Better CUDA 12.x support
+- Stable release with proven reliability
+- Good CUDA 11.8 and 12.1 support
 - Enhanced memory management
-- Native support for newer GPU architectures
-- Faster CPU operations
+- Support for modern GPU architectures
+- Efficient CPU operations
 
-#### DGL 2.5.0
+#### DGL 2.2.1
 
 - Optimized message passing for sparse graphs
-- Better PyTorch 2.x integration
-- Improved sampling algorithms
+- Good PyTorch 2.x integration
+- Efficient sampling algorithms
 - Memory efficiency improvements
-- Enhanced heterogeneous graph support
+- Solid heterogeneous graph support
 
 #### Other Libraries
 
@@ -927,7 +935,7 @@ else:
 
 #### 2. DGL API Updates
 
-Some DGL functions have new APIs in version 2.5.0.
+Some DGL functions have new APIs in version 2.2.1 and later.
 
 **Check for updated imports**:
 ```python
@@ -960,7 +968,7 @@ model = torch.load("model.pth", weights_only=True)
 #### Model Checkpoints
 
 PyTorch maintains backward compatibility:
-- ✅ Models saved with PyTorch 2.2.0 can be loaded with PyTorch 2.7.0
+- ✅ Models saved with PyTorch 2.2.0 can be loaded with PyTorch 2.2.1
 - ✅ No conversion required for most models
 - ⚠️  Use `weights_only=False` if you encounter issues (but verify trust)
 

@@ -28,15 +28,15 @@ This approach ensures a stable, compatible ecosystem while maximizing the use of
 
 ## Core Dependencies
 
-### DGL (Deep Graph Library) - `dgl==2.5.0`
+### DGL (Deep Graph Library) - `dgl==2.2.1`
 
 **Purpose**: Core graph neural network library providing graph operations, message passing, and GNN layers.
 
 **Why this version?**
-- Latest stable version as of 2025
+- Stable version compatible with PyTorch 2.2.1
 - Includes performance optimizations for sparse graphs
-- Better integration with PyTorch 2.x features
-- Security patches and bug fixes from 2024-2025
+- Good integration with PyTorch 2.x features
+- Proven stability for production use
 
 **Why pinned exactly?**
 - DGL versions can have subtle API changes that affect model behavior
@@ -53,11 +53,13 @@ This approach ensures a stable, compatible ecosystem while maximizing the use of
 
 **Installation notes**:
 ```bash
-# CPU-only version
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/repo.html
+# macOS (standard pip installation via requirements-mac.txt)
+pip install dgl==2.2.1
 
-# CUDA 12.1 version (check your CUDA version with nvidia-smi)
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/cu121/repo.html
+# Linux (requires wheel from DGL repository via requirements-linux.txt)
+pip install dgl==2.2.1 -f https://data.dgl.ai/wheels/torch-2.4/repo.html
+
+# Note: Platform-specific requirements files handle the correct installation method
 ```
 
 **References**:
@@ -65,16 +67,16 @@ pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/cu121/repo.html
 - [DGL Installation Guide](https://www.dgl.ai/dgl_docs/install/index.html)
 - [DGL Releases](https://github.com/dmlc/dgl/releases)
 
-### PyTorch - `torch==2.7.0`
+### PyTorch - `torch==2.2.1`
 
 **Purpose**: Deep learning framework providing tensor operations, automatic differentiation, and neural network modules.
 
 **Why this version?**
-- Latest stable release as of 2025
-- Performance improvements over PyTorch 2.2.0 (previous version)
-- Enhanced `torch.compile` support for faster training
-- Security patches addressing 2024-2025 CVEs
-- Better memory management and CUDA 12.x support
+- Stable release with proven compatibility
+- Compatible with DGL 2.2.1
+- Reliable performance for production use
+- Well-tested with current dependencies
+- Good memory management and CUDA support
 
 **Why pinned exactly?**
 - Model serialization compatibility (ensure saved models load correctly)
@@ -107,14 +109,14 @@ model = torch.load("checkpoint.pth", weights_only=True)
 
 **References**:
 - [PyTorch Documentation](https://pytorch.org/docs/stable/index.html)
-- [PyTorch 2.7 Release Notes](https://pytorch.org/blog/pytorch2-6/)
+- [PyTorch Release Notes](https://pytorch.org/blog/)
 
-### TorchVision - `torchvision==0.19.0`
+### TorchVision - `torchvision==0.17.1`
 
 **Purpose**: Computer vision utilities and pre-trained models (dependency for some DGL functionality).
 
 **Why this version?**
-- Compatible with PyTorch 2.7.0
+- Compatible with PyTorch 2.2.1
 - May be used for future visualization features
 
 **Note**: Not heavily used in current GRAIL implementation but maintained for ecosystem compatibility.
@@ -126,7 +128,7 @@ model = torch.load("checkpoint.pth", weights_only=True)
 **Why this version range?**
 - `>=1.26.0`: Ensures modern features and security patches
 - `<2.0.0`: Avoids NumPy 2.0 breaking changes (major API overhaul)
-- Compatible with DGL 2.5.0 and PyTorch 2.7.0
+- Compatible with DGL 2.2.1 and PyTorch 2.2.1
 
 **Why not NumPy 2.0?**
 - NumPy 2.0 introduced significant breaking changes
@@ -235,11 +237,9 @@ Understanding the compatibility between DGL and PyTorch is critical for successf
 
 | DGL Version | PyTorch Version | Python Support | CUDA Support | Notes |
 |-------------|----------------|----------------|--------------|-------|
-| 2.5.0 | 2.7.0 | 3.8 - 3.11 | 11.8, 12.1 | **Current** - Latest stable |
-| 2.4.0 | 2.5.0 - 2.6.0 | 3.8 - 3.11 | 11.8, 12.1 | Previous stable |
-| 2.3.0 | 2.4.0 - 2.5.0 | 3.8 - 3.11 | 11.8, 12.1 | Older stable |
-| 2.2.0 | 2.3.0 - 2.4.0 | 3.8 - 3.11 | 11.7, 11.8 | Legacy |
-| 2.1.0 | 2.2.0 | 3.8 - 3.11 | 11.7, 11.8 | **Previous GRAIL** |
+| 2.2.1 | 2.2.1 | 3.8 - 3.11 | 11.8, 12.1 | **Current** - Stable production |
+| 2.2.0 | 2.2.0 - 2.3.0 | 3.8 - 3.11 | 11.7, 11.8 | Previous stable |
+| 2.1.0 | 2.0.0 - 2.2.0 | 3.8 - 3.11 | 11.7, 11.8 | Legacy |
 
 ### Installation Order Matters
 
@@ -250,17 +250,17 @@ Always install in this order to avoid conflicts:
 pip uninstall -y dgl torch torchvision
 
 # 2. Install PyTorch first (DGL depends on it)
-pip install torch==2.7.0 torchvision==0.19.0
+pip install torch==2.2.1 torchvision==0.17.1
 
 # 3. Install DGL with appropriate backend
-# For CPU:
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/repo.html
+# For macOS:
+pip install -r requirements-mac.txt
 
-# For CUDA 12.1:
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/cu121/repo.html
+# For Linux:
+pip install -r requirements-linux.txt
 
 # 4. Install remaining dependencies
-pip install -r requirements.txt
+# (Already included in platform-specific requirements)
 ```
 
 ### CUDA Version Detection
@@ -289,8 +289,8 @@ nvidia-smi
 - **Solution**: Reinstall PyTorch with correct CUDA version
 
 **Problem**: `AttributeError: module 'torch' has no attribute 'XXX'`
-- **Cause**: PyTorch version too old for DGL features
-- **Solution**: Upgrade PyTorch to 2.7.0
+- **Cause**: PyTorch version mismatch
+- **Solution**: Ensure PyTorch 2.2.1 is installed
 
 ## Development Dependencies
 
@@ -471,8 +471,9 @@ These dependencies are not required but may enhance functionality.
 ### GPU Acceleration
 
 **CUDA Toolkit**: Required for GPU training
-- **Version**: 11.8 or 12.1 (must match DGL/PyTorch installation)
+- **Version**: 11.8 or 12.1 (must match PyTorch installation)
 - **Installation**: [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
+- **Note**: Linux requires special DGL wheels from https://data.dgl.ai/wheels/torch-2.4/repo.html
 
 **Verification**:
 ```python
@@ -497,7 +498,7 @@ pip install jupyter
 
 ### Python 3.13 Migration
 
-**Current status**: DGL 2.5.0 does not support Python 3.13 (as of 2025-11-04)
+**Current status**: DGL 2.2.1 does not support Python 3.13 (as of 2025-11-04)
 
 **Migration timeline**: When DGL adds Python 3.13 support (estimated 2025-2026)
 
@@ -598,18 +599,15 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 # 3. Upgrade pip
 pip install --upgrade pip setuptools wheel
 
-# 4. Install PyTorch first
-pip install torch==2.7.0 torchvision==0.19.0
+# 4. Install platform-specific dependencies
+# For macOS:
+pip install -r requirements-mac.txt
 
-# 5. Install DGL (choose CPU or GPU version)
-# CPU version:
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/repo.html
+# For Linux:
+pip install -r requirements-linux.txt
 
-# CUDA 12.1 version:
-# pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/cu121/repo.html
-
-# 6. Install remaining dependencies
-pip install -r requirements.txt
+# 6. Install remaining dependencies (if not already included)
+# Requirements files include: torch==2.2.1, torchvision==0.17.1, dgl==2.2.1, and others
 
 # 7. Install development tools (optional)
 pip install -r requirements-dev.txt
@@ -656,17 +654,11 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
-COPY requirements.txt .
+# Copy requirements (Linux version for Docker)
+COPY requirements-linux.txt .
 
-# Install PyTorch first
-RUN pip install --no-cache-dir torch==2.7.0 torchvision==0.19.0
-
-# Install DGL (CPU version)
-RUN pip install --no-cache-dir dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/repo.html
-
-# Install remaining dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements-linux.txt
 
 # Copy application code
 COPY . .
@@ -685,14 +677,12 @@ conda create -n grail python=3.11
 # 2. Activate environment
 conda activate grail
 
-# 3. Install PyTorch via conda
-conda install pytorch==2.7.0 torchvision==0.19.0 -c pytorch
+# 3. Install dependencies via pip
+# For macOS:
+pip install -r requirements-mac.txt
 
-# 4. Install DGL via pip (conda channel may be outdated)
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/repo.html
-
-# 5. Install remaining dependencies
-pip install -r requirements.txt
+# For Linux:
+pip install -r requirements-linux.txt
 ```
 
 **Note**: Mixing conda and pip can cause dependency conflicts. Use pip-only installation when possible.
@@ -712,7 +702,10 @@ python -c "import dgl; print(dgl.__version__)"
 
 # Reinstall DGL if version is incorrect
 pip uninstall -y dgl
-pip install dgl==2.5.0 -f https://data.dgl.ai/wheels/torch-2.7/repo.html
+# For macOS:
+pip install dgl==2.2.1
+# For Linux:
+pip install dgl==2.2.1 -f https://data.dgl.ai/wheels/torch-2.4/repo.html
 ```
 
 #### Issue: `RuntimeError: Expected all tensors to be on the same device`
