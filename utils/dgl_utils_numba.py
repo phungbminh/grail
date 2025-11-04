@@ -37,8 +37,8 @@ def _bfs_csr_numba(indptr, indices, roots, max_hops, max_nodes_per_hop=-1):
         if len(current_lvl) == 0:
             break
 
-        # Find all neighbors of current level
-        next_lvl_set = set()
+        # Find all neighbors of current level (using list instead of set)
+        next_lvl_list = []
         for node in current_lvl:
             # Get neighbors from CSR structure
             start = indptr[node]
@@ -46,22 +46,20 @@ def _bfs_csr_numba(indptr, indices, roots, max_hops, max_nodes_per_hop=-1):
             for i in range(start, end):
                 neighbor = indices[i]
                 if not visited[neighbor]:
-                    next_lvl_set.add(neighbor)
+                    next_lvl_list.append(neighbor)
+                    visited[neighbor] = True  # Mark immediately to avoid duplicates
 
-        if len(next_lvl_set) == 0:
+        if len(next_lvl_list) == 0:
             break
 
-        # Convert set to array
-        next_lvl = np.array(list(next_lvl_set), dtype=np.int64)
+        # Convert to array and remove duplicates if any
+        next_lvl = np.array(next_lvl_list, dtype=np.int64)
+        next_lvl = np.unique(next_lvl)
 
         # Sample if too many nodes
         if max_nodes_per_hop > 0 and len(next_lvl) > max_nodes_per_hop:
             indices_sample = np.random.choice(len(next_lvl), max_nodes_per_hop, replace=False)
             next_lvl = next_lvl[indices_sample]
-
-        # Mark as visited
-        for node in next_lvl:
-            visited[node] = True
 
         levels.append(next_lvl)
         current_lvl = next_lvl
@@ -111,15 +109,19 @@ def _get_neighbors_numba(indptr, indices, nodes):
         nodes: Numpy array of node IDs
 
     Returns:
-        Set of neighbor node IDs
+        Numpy array of unique neighbor node IDs
     """
-    neighbors = set()
+    neighbors_list = []
     for node in nodes:
         start = indptr[node]
         end = indptr[node + 1]
         for i in range(start, end):
-            neighbors.add(indices[i])
-    return neighbors
+            neighbors_list.append(indices[i])
+
+    # Return unique neighbors
+    if len(neighbors_list) == 0:
+        return np.array([], dtype=np.int64)
+    return np.unique(np.array(neighbors_list, dtype=np.int64))
 
 
 def _get_neighbors_fast(adj, nodes):
@@ -137,5 +139,5 @@ def _get_neighbors_fast(adj, nodes):
         adj = adj.tocsr()
 
     nodes_array = np.array(list(nodes), dtype=np.int64)
-    neighbors = _get_neighbors_numba(adj.indptr, adj.indices, nodes_array)
-    return neighbors
+    neighbors_array = _get_neighbors_numba(adj.indptr, adj.indices, nodes_array)
+    return set(neighbors_array.tolist())
