@@ -15,6 +15,15 @@ import sys
 import torch
 from scipy.special import softmax
 from utils.dgl_utils import _bfs_relational
+# Use numba-optimized version for 10-100x speedup
+try:
+    from utils.dgl_utils_numba import _bfs_relational_numba as _bfs_relational_fast
+    USE_NUMBA = True
+except ImportError:
+    _bfs_relational_fast = _bfs_relational
+    USE_NUMBA = False
+    import warnings
+    warnings.warn("Numba not installed. Install 'numba>=0.59.0' for 10-100x BFS speedup.")
 from utils.graph_utils import incidence_matrix, remove_nodes, ssp_to_torch, serialize, deserialize, get_edge_count, diameter, radius
 import networkx as nx
 
@@ -165,7 +174,8 @@ def extract_save_subgraph(args_):
 
 
 def get_neighbor_nodes(roots, adj, h=1, max_nodes_per_hop=None):
-    bfs_generator = _bfs_relational(adj, roots, max_nodes_per_hop)
+    # Use numba-optimized version if available
+    bfs_generator = _bfs_relational_fast(adj, roots, max_nodes_per_hop)
     lvls = list()
     for _ in range(h):
         try:
