@@ -4,7 +4,6 @@ import struct
 import logging
 import random
 import pickle as pkl
-import pdb
 from tqdm import tqdm
 import lmdb
 import multiprocessing as mp

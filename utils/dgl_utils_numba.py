@@ -5,7 +5,6 @@ Significantly faster than scipy sparse matrix operations.
 import numpy as np
 import scipy.sparse as ssp
 from numba import jit, prange
-import random
 
 
 @jit(nopython=True, cache=True)
