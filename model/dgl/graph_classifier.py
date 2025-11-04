@@ -1,5 +1,5 @@
 from .rgcn_model import RGCN
-from dgl import mean_nodes
+import dgl
 import torch.nn as nn
 import torch
 """
@@ -27,7 +27,7 @@ class GraphClassifier(nn.Module):
         g, rel_labels = data
         g.ndata['h'] = self.gnn(g)
 
-        g_out = mean_nodes(g, 'repr')
+        g_out = dgl.mean_nodes(g, 'repr')
 
         head_ids = (g.ndata['id'] == 1).nonzero().squeeze(1)
         head_embs = g.ndata['repr'][head_ids]
