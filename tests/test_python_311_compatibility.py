@@ -26,7 +26,7 @@ class TestDependencyVersions:
     """Verify all dependencies meet minimum version requirements."""
 
     def test_dgl_version(self):
-        """Ensure DGL is at least version 2.5.0."""
+        """Ensure DGL is at least version 2.2.1."""
         try:
             import dgl
         except ImportError:
@@ -37,12 +37,13 @@ class TestDependencyVersions:
         version_parts = dgl.__version__.split(".")
         major = int(version_parts[0])
         minor = int(version_parts[1])
-        assert (major, minor) >= (2, 5), (
-            f"DGL 2.5.0+ required, got {dgl.__version__}"
+        patch = int(version_parts[2]) if len(version_parts) > 2 else 0
+        assert (major, minor, patch) >= (2, 2, 1), (
+            f"DGL 2.2.1+ required, got {dgl.__version__}"
         )
 
     def test_pytorch_version(self):
-        """Ensure PyTorch is at least version 2.7.0."""
+        """Ensure PyTorch is at least version 2.2.1."""
         try:
             import torch
         except ImportError:
@@ -54,8 +55,9 @@ class TestDependencyVersions:
         version_parts = version.split(".")
         major = int(version_parts[0])
         minor = int(version_parts[1])
-        assert (major, minor) >= (2, 7), (
-            f"PyTorch 2.7.0+ required, got {torch.__version__}"
+        patch = int(version_parts[2]) if len(version_parts) > 2 else 0
+        assert (major, minor, patch) >= (2, 2, 1), (
+            f"PyTorch 2.2.1+ required, got {torch.__version__}"
         )
 
     def test_networkx_version(self):

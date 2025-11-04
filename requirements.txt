@@ -1,10 +1,11 @@
 # Core Graph Learning Framework
 # DGL compatibility is the foundation - all versions must align
-dgl==2.5.0  # Latest version, requires Python 3.11 max
+# For Linux: pip install dgl -f https://data.dgl.ai/wheels/torch-2.4/repo.html
+dgl==2.2.1  # Stable version for Python 3.11
 
 # Deep Learning Framework
-torch==2.7.0  # Latest stable, Python 3.13 ready
-torchvision==0.19.0  # Compatible with torch 2.7.0
+torch==2.2.1  # Stable PyTorch version
+torchvision==0.17.1  # Compatible with torch 2.2.1
 
 # Scientific Computing Stack
 numpy>=1.26.0,<2.0.0  # DGL compatibility, avoid numpy 2.0 breaking changes

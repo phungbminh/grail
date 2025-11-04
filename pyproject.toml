@@ -4,8 +4,9 @@ version = "1.0.0"
 description = "Graph Representation And Inductive Learning"
 requires-python = ">=3.11,<3.12"  # DGL constraint
 dependencies = [
-    "dgl==2.5.0",
-    "torch==2.7.0",
+    "dgl==2.2.1",
+    "torch==2.2.1",
+    "torchvision==0.17.1",
     "networkx>=3.5",
     "scikit-learn>=1.6.0",
     "tqdm>=4.67.0",

@@ -26,8 +26,19 @@ This project requires **Python 3.11** for compatibility with DGL 2.5.0. Python 3
    ```
 
 3. **Install dependencies**
+
+   For **macOS**:
    ```bash
    pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+
+   For **Linux**:
+   ```bash
+   pip install --upgrade pip
+   # Install DGL with special wheel repo
+   pip install dgl -f https://data.dgl.ai/wheels/torch-2.4/repo.html
+   # Install remaining dependencies
    pip install -r requirements.txt
    ```
 
@@ -40,8 +51,8 @@ This project requires **Python 3.11** for compatibility with DGL 2.5.0. Python 3
 ### Dependencies
 
 Key dependencies:
-- **DGL**: 2.5.0 (Deep Graph Library)
-- **PyTorch**: 2.7.0 (with torchvision 0.19.0)
+- **DGL**: 2.2.1 (Deep Graph Library)
+- **PyTorch**: 2.2.1 (with torchvision 0.17.1)
 - **NetworkX**: >=3.5
 - **scikit-learn**: >=1.6.0
 - **NumPy**: >=1.26.0, <2.0.0
