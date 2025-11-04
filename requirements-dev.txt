@@ -1,0 +1,18 @@
+# Include production requirements
+-r requirements.txt
+
+# Code Quality and Formatting
+ruff==0.14.3  # Modern all-in-one linter and formatter
+mypy==1.14.0  # Type checking
+pre-commit==4.0.0  # Git hooks for code quality
+
+# Testing Framework
+pytest>=8.3.0
+pytest-cov>=6.0.0
+pytest-xdist>=3.6.0  # Parallel test execution
+pytest-timeout>=2.3.0
+pytest-mock>=3.14.0  # Mocking utilities
+
+# Documentation
+sphinx>=8.0.0  # If docs are added later
+sphinx-rtd-theme>=3.0.0

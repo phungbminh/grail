@@ -7,20 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class Identity(nn.Module):
-    """A placeholder identity operator that is argument-insensitive.
-    (Identity has already been supported by PyTorch 1.2, we will directly
-    import torch.nn.Identity in the future)
-    """
-
-    def __init__(self):
-        super(Identity, self).__init__()
-
-    def forward(self, x):
-        """Return input"""
-        return x
-
-
 class RGCNLayer(nn.Module):
     def __init__(self, inp_dim, out_dim, aggregator, bias=None, activation=None, dropout=0.0, edge_dropout=0.0, is_input_layer=False):
         super(RGCNLayer, self).__init__()
@@ -42,7 +28,7 @@ class RGCNLayer(nn.Module):
         if edge_dropout:
             self.edge_dropout = nn.Dropout(edge_dropout)
         else:
-            self.edge_dropout = Identity()
+            self.edge_dropout = nn.Identity()
 
     # define how propagation is done in subclass
     def propagate(self, g):
