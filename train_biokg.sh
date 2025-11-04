@@ -14,7 +14,7 @@ python train.py \
     --emb_dim 32 \
     --num_bases 4 \
     --hop 3 \
-    --enclosing_sub_graph \
+    --enclosing_sub_graph True \
     --num_neg_samples_per_link 1 \
     --batch_size 16 \
     --lr 0.001 \
@@ -22,6 +22,8 @@ python train.py \
     --clip 1000 \
     --l2 5e-4 \
     --edge_dropout 0.3 \
-    --gnn_agg_type sum
+    --gnn_agg_type sum \
+    --add_traspose_rels True \
+    --add_ht_emb True
 
 echo "Training complete! Results saved in experiments/grail_biokg/"
