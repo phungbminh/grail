@@ -6,13 +6,15 @@
 # pip install dgl -f https://data.dgl.ai/wheels/torch-2.4/repo.html
 
 # Deep Learning Framework (install before DGL)
-torch==2.2.1  # Stable PyTorch version
-torchvision==0.17.1  # Compatible with torch 2.2.1
+torch==2.2.0  # Stable PyTorch version
+torchvision==0.17.0  # Compatible with torch 2.2.0
+torchdata==0.7.1  # Required by DGL for dataloading
 
 # Scientific Computing Stack
 numpy>=1.26.0,<2.0.0  # DGL compatibility, avoid numpy 2.0 breaking changes
 networkx>=3.5  # Latest, Python 3.13 ready
 scikit-learn>=1.6.0  # Latest, Python 3.13 ready
+pyyaml>=6.0  # YAML configuration parsing
 
 # Data Management
 lmdb==1.5.1  # Latest version
