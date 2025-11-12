@@ -7,11 +7,41 @@ import lmdb
 import numpy as np
 import json
 import pickle
+import time
 import torch
 import dgl
+from tqdm import tqdm
 from utils.graph_utils import ssp_multigraph_to_dgl, incidence_matrix
 from utils.data_utils import process_files, save_to_file, plot_rel_dist
 from .graph_sampler import *
+
+
+def process_sampling_task(task):
+    """Process a single sampling task - defined at module level for pickle compatibility"""
+    from .graph_sampler import sample_fair_neg
+    import traceback
+
+    try:
+        logging.info(f"Starting sampling for {task['split_name']} ({len(task['triplets']):,} triplets)")
+        start_time = time.time()
+
+        pos, neg = sample_fair_neg(
+            task['adj_list'],
+            task['triplets'],
+            task['data_dir'],
+            task['num_neg_samples_per_link'],
+            max_size=task['max_size'],
+            constrained_neg_prob=task['constrained_neg_prob']
+        )
+
+        elapsed = time.time() - start_time
+        logging.info(f"Completed {task['split_name']} sampling in {elapsed:.1f}s ({len(neg):,} negatives)")
+
+        return task['split_name'], pos, neg
+    except Exception as e:
+        logging.error(f"Error in process_sampling_task for {task['split_name']}: {e}")
+        logging.error(f"Full traceback: {traceback.format_exc()}")
+        raise
 
 
 def generate_subgraph_datasets(params, splits=['train', 'valid'], saved_relation2id=None, max_label_value=None):
@@ -31,16 +61,88 @@ def generate_subgraph_datasets(params, splits=['train', 'valid'], saved_relation
     for split_name in splits:
         graphs[split_name] = {'triplets': triplets[split_name], 'max_size': params.max_links}
 
-    # Sample train and valid/test links
+    # Get data directory for entity type mapping
+    data_dir = os.path.join(params.main_dir, f'data/{params.dataset}')
+
+    # OPTIMIZATION: Sample train and valid/test links in parallel with 8 cores
+    logging.info("Starting ULTRA-FAST parallel negative sampling with 8 cores...")
+
+    # Prepare data for parallel processing
+    sampling_tasks = []
     for split_name, split in graphs.items():
-        logging.info(f"Sampling negative links for {split_name}")
-        split['pos'], split['neg'] = sample_neg(adj_list, split['triplets'], params.num_neg_samples_per_link, max_size=split['max_size'], constrained_neg_prob=params.constrained_neg_prob)
+        sampling_tasks.append({
+            'split_name': split_name,
+            'adj_list': adj_list,
+            'triplets': split['triplets'],
+            'data_dir': data_dir,
+            'num_neg_samples_per_link': params.num_neg_samples_per_link,
+            'max_size': split['max_size'],
+            'constrained_neg_prob': params.constrained_neg_prob
+        })
+
+    # Process all splits in parallel with 8 cores
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import threading
+    import queue
+
+    # Progress tracking
+    completed_tasks = 0
+    total_tasks = len(sampling_tasks)
+    start_total = time.time()
+
+    # Process with all available cores for maximum speed
+    import multiprocessing
+    num_workers = min(multiprocessing.cpu_count(), 15)  # Use up to 15 workers
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        futures = [executor.submit(process_sampling_task, task) for task in sampling_tasks]
+
+        # Collect results as they complete
+        for future in as_completed(futures):
+            try:
+                split_name, pos, neg = future.result()
+                graphs[split_name]['pos'] = pos
+                graphs[split_name]['neg'] = neg
+                completed_tasks += 1
+
+                # Progress update
+                elapsed = time.time() - start_total
+                eta = (total_tasks - completed_tasks) * elapsed / completed_tasks
+                logging.info(f"Progress: {completed_tasks}/{total_tasks} splits completed | ETA: {eta/60:.1f}min")
+
+            except Exception as e:
+                import traceback
+                logging.error(f"Sampling task failed: {e}")
+                logging.error(f"Full traceback: {traceback.format_exc()}")
+
+    logging.info("ALL SAMPLING TASKS COMPLETED!")
 
     if testing:
         directory = os.path.join(params.main_dir, 'data/{}/'.format(params.dataset))
         save_to_file(directory, f'neg_{params.test_file}_{params.constrained_neg_prob}.txt', graphs['test']['neg'], id2entity, id2relation)
 
-    links2subgraphs(adj_list, graphs, params, max_label_value)
+    # Load semantic embeddings if semantic pruning is enabled
+    semantic_embeddings = None
+    if hasattr(params, 'use_semantic_pruning') and params.use_semantic_pruning:
+        if params.semantic_embeddings_path:
+            # Load embeddings from specified path
+            logging.info(f"Loading semantic embeddings from {params.semantic_embeddings_path}")
+            semantic_embeddings = np.load(params.semantic_embeddings_path)
+        else:
+            # Load default KGE embeddings
+            logging.info(f"Loading default {params.kge_model} embeddings for semantic pruning")
+            semantic_embeddings, _ = get_kge_embeddings(params.dataset, params.kge_model)
+
+        if semantic_embeddings is not None:
+            logging.info(f"Loaded semantic embeddings with shape: {semantic_embeddings.shape}")
+
+    # Ensure subgraph extraction completed successfully before proceeding
+    links2subgraphs(adj_list, graphs, params, max_label_value, semantic_embeddings)
+
+    # Verify that the database directory exists
+    if not os.path.isdir(params.db_path):
+        logging.error(f"LMDB database directory not found: {params.db_path}")
+        raise FileNotFoundError(f"LMDB database directory not found: {params.db_path}")
 
 
 def get_kge_embeddings(dataset, kge_model):
@@ -117,12 +219,18 @@ class SubgraphDataset(Dataset):
         with self.main_env.begin(db=self.db_neg) as txn:
             self.num_graphs_neg = int.from_bytes(txn.get('num_graphs'.encode()), byteorder='little')
 
+        # Test loading first subgraph with progress indication
+        print("[DATASET] Loading first subgraph to initialize...")
+        start_time = time.time()
         self.__getitem__(0)
+        init_time = time.time() - start_time
+        print(f"[DATASET] First subgraph loaded in {init_time:.4f} seconds")
 
     def __getitem__(self, index):
         with self.main_env.begin(db=self.db_pos) as txn:
             str_id = '{:08}'.format(index).encode('ascii')
-            nodes_pos, r_label_pos, g_label_pos, n_labels_pos = deserialize(txn.get(str_id)).values()
+            data_pos = deserialize(txn.get(str_id))
+            nodes_pos, r_label_pos, g_label_pos, n_labels_pos = data_pos['nodes'], data_pos['r_label'], data_pos['g_label'], data_pos['n_label']
             subgraph_pos = self._prepare_subgraphs(nodes_pos, r_label_pos, n_labels_pos)
         subgraphs_neg = []
         r_labels_neg = []
@@ -130,7 +238,8 @@ class SubgraphDataset(Dataset):
         with self.main_env.begin(db=self.db_neg) as txn:
             for i in range(self.num_neg_samples_per_link):
                 str_id = '{:08}'.format(index + i * (self.num_graphs_pos)).encode('ascii')
-                nodes_neg, r_label_neg, g_label_neg, n_labels_neg = deserialize(txn.get(str_id)).values()
+                data_neg = deserialize(txn.get(str_id))
+                nodes_neg, r_label_neg, g_label_neg, n_labels_neg = data_neg['nodes'], data_neg['r_label'], data_neg['g_label'], data_neg['n_label']
                 subgraphs_neg.append(self._prepare_subgraphs(nodes_neg, r_label_neg, n_labels_neg))
                 r_labels_neg.append(r_label_neg)
                 g_labels_neg.append(g_label_neg)
@@ -141,14 +250,21 @@ class SubgraphDataset(Dataset):
         return self.num_graphs_pos
 
     def _prepare_subgraphs(self, nodes, r_label, n_labels):
-        subgraph = dgl.DGLGraph(self.graph.subgraph(nodes))
-        subgraph.edata['type'] = self.graph.edata['type'][self.graph.subgraph(nodes).parent_eid]
+        subgraph = self.graph.subgraph(nodes)
+        subgraph.edata['type'] = self.graph.edata['type'][subgraph.edata[dgl.EID]]
         subgraph.edata['label'] = torch.tensor(r_label * np.ones(subgraph.edata['type'].shape), dtype=torch.long)
 
-        edges_btw_roots = subgraph.edge_id(0, 1)
-        rel_link = np.nonzero(subgraph.edata['type'][edges_btw_roots] == r_label)
-        if rel_link.squeeze().nelement() == 0:
-            subgraph.add_edge(0, 1)
+        # Check if edge exists between roots, handle DGL API
+        try:
+            edges_btw_roots = subgraph.edge_ids(0, 1)
+            rel_link = np.nonzero(subgraph.edata['type'][edges_btw_roots] == r_label)
+            if rel_link.squeeze().nelement() == 0:
+                subgraph.add_edges(0, 1)
+                subgraph.edata['type'][-1] = torch.tensor(r_label).type(torch.LongTensor)
+                subgraph.edata['label'][-1] = torch.tensor(r_label).type(torch.LongTensor)
+        except:
+            # Edge doesn't exist, add it
+            subgraph.add_edges(0, 1)
             subgraph.edata['type'][-1] = torch.tensor(r_label).type(torch.LongTensor)
             subgraph.edata['label'][-1] = torch.tensor(r_label).type(torch.LongTensor)
 

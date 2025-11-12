@@ -31,12 +31,12 @@ class KGEModel(nn.Module):
 
         self.gamma = nn.Parameter(
             torch.Tensor([gamma]),
-            requires_grad=False
+            requires_grad=True
         )
 
         self.embedding_range = nn.Parameter(
             torch.Tensor([(self.gamma.item() + self.epsilon) / hidden_dim]),
-            requires_grad=False
+            requires_grad=True
         )
 
         self.entity_dim = hidden_dim * 2 if double_entity_embedding else hidden_dim

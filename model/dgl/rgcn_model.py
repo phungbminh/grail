@@ -31,7 +31,8 @@ class RGCN(nn.Module):
         self.device = params.device
 
         if self.has_attn:
-            self.attn_rel_emb = nn.Embedding(self.num_rels, self.attn_rel_emb_dim, sparse=False)
+            # Use aug_num_rels to support both original and transpose relations
+            self.attn_rel_emb = nn.Embedding(self.aug_num_rels, self.attn_rel_emb_dim, sparse=False)
         else:
             self.attn_rel_emb = None
 
@@ -69,6 +70,7 @@ class RGCN(nn.Module):
             self.layers.append(h2h)
 
     def build_input_layer(self):
+        print(f"[DEBUG] RGCN input layer: aug_num_rels={self.aug_num_rels}")
         return RGCNLayer(self.inp_dim,
                          self.emb_dim,
                          # self.input_basis_weights,

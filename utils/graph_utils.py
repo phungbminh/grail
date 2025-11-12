@@ -60,25 +60,48 @@ def ssp_to_torch(A, device, dense=False):
 
 def ssp_multigraph_to_dgl(graph, n_feats=None):
     """
-    Converting ssp multigraph (i.e. list of adjs) to dgl multigraph.
+    FAST VERSION: Converting ssp multigraph to DGL multigraph directly without NetworkX
     """
+    import time
+    print("[GRAPH] FAST: Converting sparse matrices to DGL graph...")
+    start_time = time.time()
 
-    g_nx = nx.MultiDiGraph()
-    g_nx.add_nodes_from(list(range(graph[0].shape[0])))
-    # Add edges
+    num_nodes = graph[0].shape[0]
+    print(f"[GRAPH] FAST: Graph has {num_nodes} nodes")
+
+    # Collect all edges and relations
+    all_src = []
+    all_dst = []
+    all_types = []
+
+    total_edges = 0
     for rel, adj in enumerate(graph):
-        # Convert adjacency matrix to tuples for nx0
-        nx_triplets = []
-        for src, dst in list(zip(adj.tocoo().row, adj.tocoo().col)):
-            nx_triplets.append((src, dst, {'type': rel}))
-        g_nx.add_edges_from(nx_triplets)
+        coo = adj.tocoo()
+        if len(coo.row) > 0:
+            all_src.extend(coo.row.tolist())
+            all_dst.extend(coo.col.tolist())
+            all_types.extend([rel] * len(coo.row))
+            total_edges += len(coo.row)
+            print(f"[GRAPH] FAST: Relation {rel}: {len(coo.row)} edges")
 
-    # make dgl graph
-    g_dgl = dgl.DGLGraph(multigraph=True)
-    g_dgl.from_networkx(g_nx, edge_attrs=['type'])
+    print(f"[GRAPH] FAST: Total edges: {total_edges}")
+
+    # Create DGL heterograph directly - MUCH FASTER
+    import torch
+    src_tensor = torch.tensor(all_src, dtype=torch.int64)
+    dst_tensor = torch.tensor(all_dst, dtype=torch.int64)
+    type_tensor = torch.tensor(all_types, dtype=torch.int64)
+
+    print("[GRAPH] FAST: Creating DGL graph...")
+    g_dgl = dgl.graph((src_tensor, dst_tensor), num_nodes=num_nodes)
+    g_dgl.edata['type'] = type_tensor
+
     # add node features
     if n_feats is not None:
         g_dgl.ndata['feat'] = torch.tensor(n_feats)
+
+    conversion_time = time.time() - start_time
+    print(f"[GRAPH] FAST: Graph conversion completed in {conversion_time:.2f} seconds")
 
     return g_dgl
 
@@ -105,8 +128,9 @@ def move_batch_to_device_dgl(batch, device):
     targets_neg = torch.LongTensor(targets_neg).to(device=device)
     r_labels_neg = torch.LongTensor(r_labels_neg).to(device=device)
 
-    g_dgl_pos = send_graph_to_device(g_dgl_pos, device)
-    g_dgl_neg = send_graph_to_device(g_dgl_neg, device)
+    # Move entire graphs to device first, then send individual features
+    g_dgl_pos = g_dgl_pos.to(device)
+    g_dgl_neg = g_dgl_neg.to(device)
 
     return ((g_dgl_pos, r_labels_pos), targets_pos, (g_dgl_neg, r_labels_neg), targets_neg)
 

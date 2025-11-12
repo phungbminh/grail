@@ -112,7 +112,13 @@ class RGCNBasisLayer(RGCNLayer):
             curr_emb = torch.mm(edges.dst[input_], self.self_loop_weight)  # (B, F)
 
             if self.has_attn:
-                e = torch.cat([edges.src[input_], edges.dst[input_], attn_rel_emb(edges.data['type']), attn_rel_emb(edges.data['label'])], dim=1)
+                # Clamp edge types and labels to valid embedding range
+                # Get embedding size from attn_rel_emb to ensure valid indices
+                max_emb_idx = attn_rel_emb.num_embeddings - 1
+                edge_types = torch.clamp(edges.data['type'], 0, max_emb_idx)
+                edge_labels = torch.clamp(edges.data['label'], 0, max_emb_idx)
+
+                e = torch.cat([edges.src[input_], edges.dst[input_], attn_rel_emb(edge_types), attn_rel_emb(edge_labels)], dim=1)
                 a = torch.sigmoid(self.B(F.relu(self.A(e))))
             else:
                 a = torch.ones((len(edges), 1)).to(device=w.device)

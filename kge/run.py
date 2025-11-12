@@ -242,7 +242,14 @@ def main(args):
         logging.info('Parameter %s: %s, require_grad = %s' % (name, str(param.size()), str(param.requires_grad)))
 
     if args.cuda:
-        kge_model = kge_model.cuda()
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+            kge_model = kge_model.to(device)
+            logging.info(f'Model moved to GPU: {torch.cuda.get_device_name()}')
+            logging.info(f'GPU Memory: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.1f}GB')
+        else:
+            logging.warning('CUDA not available! Using CPU.')
+            args.cuda = False
 
     if args.do_train:
         # Set training dataloader iterator
@@ -304,7 +311,7 @@ def main(args):
     # Set valid dataloader as it would be evaluated during training
 
     if args.do_train:
-        logging.info('learning_rate = %d' % current_learning_rate)
+        logging.info('learning_rate = %f' % current_learning_rate)
 
         training_logs = []
 

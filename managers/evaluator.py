@@ -5,6 +5,7 @@ import pdb
 from sklearn import metrics
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
 class Evaluator():
@@ -18,7 +19,7 @@ class Evaluator():
         pos_labels = []
         neg_scores = []
         neg_labels = []
-        dataloader = DataLoader(self.data, batch_size=self.params.batch_size, shuffle=False, num_workers=self.params.num_workers, collate_fn=self.params.collate_fn)
+        dataloader = DataLoader(self.data, batch_size=self.params.batch_size, shuffle=False, num_workers=0, collate_fn=self.params.collate_fn)
 
         self.graph_classifier.eval()
         with torch.no_grad():

@@ -1,10 +1,14 @@
 import os
+import sys
 import random
 import argparse
 import logging
 import json
 import time
 import multiprocessing as mp
+
+# Add parent directory to path to import utils module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import numpy as np
@@ -14,88 +18,32 @@ from tqdm import tqdm
 import networkx as nx
 
 from ogb.linkproppred import LinkPropPredDataset, Evaluator
+from subgraph_extraction.graph_sampler import subgraph_extraction_labeling
+from utils.graph_utils import incidence_matrix, remove_nodes, ssp_multigraph_to_dgl
 from utils.dgl_utils import _bfs_relational
-from utils.graph_utils import incidence_matrix, remove_nodes, ssp_to_torch, serialize, deserialize
+from utils.data_utils import process_files as process_files_original
 
-# Helper functions copied from test_ranking.py to make the script self-contained
-
+# Wrapper to match the signature expected by test code
 def process_files(files, saved_relation2id, add_traspose_rels):
-    entity2id = {}
-    relation2id = saved_relation2id
-    triplets = {}
-    ent = 0
-    for file_type, file_path in files.items():
-        data = []
-        with open(file_path) as f:
-            file_data = [line.split() for line in f.read().split('\n')[:-1]]
-        for triplet in file_data:
-            if triplet[0] not in entity2id:
-                entity2id[triplet[0]] = ent
-                ent += 1
-            if triplet[2] not in entity2id:
-                entity2id[triplet[2]] = ent
-                ent += 1
-            if triplet[1] in saved_relation2id:
-                data.append([entity2id[triplet[0]], entity2id[triplet[2]], saved_relation2id[triplet[1]]])
-        triplets[file_type] = np.array(data)
-    id2entity = {v: k for k, v in entity2id.items()}
-    adj_list = []
-    for i in range(len(saved_relation2id)):
-        idx = np.argwhere(triplets['graph'][:, 2] == i)
-        adj_list.append(ssp.csc_matrix((np.ones(len(idx), dtype=np.uint8), (triplets['graph'][:, 0][idx].squeeze(1), triplets['graph'][:, 1][idx].squeeze(1))), shape=(len(entity2id), len(entity2id))))
+    """Wrapper around utils.data_utils.process_files with transpose support"""
+    adj_list, triplets, entity2id, relation2id, id2entity, id2relation = process_files_original(files, saved_relation2id)
+
+    # Add transpose relations if requested
     if add_traspose_rels:
         adj_list_t = [adj.T for adj in adj_list]
         adj_list = adj_list + adj_list_t
-    dgl_adj_list = ssp_multigraph_to_dgl(adj_list)
-    return adj_list, dgl_adj_list, triplets, entity2id, relation2id, id2entity
 
-def ssp_multigraph_to_dgl(graph, n_feats=None):
-    g_nx = nx.MultiDiGraph()
-    g_nx.add_nodes_from(list(range(graph[0].shape[0])))
-    for rel, adj in enumerate(graph):
-        nx_triplets = []
-        for src, dst in list(zip(adj.tocoo().row, adj.tocoo().col)):
-            nx_triplets.append((src, dst, {'type': rel}))
-        g_nx.add_edges_from(nx_triplets)
-    g_dgl = dgl.DGLGraph(multigraph=True)
-    g_dgl.from_networkx(g_nx, edge_attrs=['type'])
-    if n_feats is not None:
-        g_dgl.ndata['feat'] = torch.tensor(n_feats)
-    return g_dgl
+    # Convert to DGL
+    dgl_adj_list = ssp_multigraph_to_dgl(adj_list)
+
+    return adj_list, dgl_adj_list, triplets, entity2id, relation2id, id2entity
 
 def intialize_worker(model, adj_list, dgl_adj_list, params, node_features, kge_entity2id):
     global model_, adj_list_, dgl_adj_list_, params_, node_features_, kge_entity2id_
     model_, adj_list_, dgl_adj_list_, params_, node_features_, kge_entity2id_ = model, adj_list, dgl_adj_list, params, node_features, kge_entity2id
 
-def get_neighbor_nodes(roots, adj, h=1, max_nodes_per_hop=None):
-    bfs_generator = _bfs_relational(adj, roots, max_nodes_per_hop)
-    lvls = list()
-    for _ in range(h):
-        try:
-            lvls.append(next(bfs_generator))
-        except StopIteration:
-            pass
-    return set().union(*lvls)
-
-def subgraph_extraction_labeling(ind, rel, A_list, h=1, enclosing_sub_graph=False, max_nodes_per_hop=None, node_information=None, max_node_label_value=None):
-    A_incidence = incidence_matrix(A_list)
-    A_incidence += A_incidence.T
-    root1_nei = get_neighbor_nodes(set([ind[0]]), A_incidence, h, max_nodes_per_hop)
-    root2_nei = get_neighbor_nodes(set([ind[1]]), A_incidence, h, max_nodes_per_hop)
-    subgraph_nei_nodes_int = root1_nei.intersection(root2_nei)
-    subgraph_nei_nodes_un = root1_nei.union(root2_nei)
-    if enclosing_sub_graph:
-        subgraph_nodes = list(ind) + list(subgraph_nei_nodes_int)
-    else:
-        subgraph_nodes = list(ind) + list(subgraph_nei_nodes_un)
-    subgraph = [adj[subgraph_nodes, :][:, subgraph_nodes] for adj in A_list]
-    labels, enclosing_subgraph_nodes = node_label(incidence_matrix(subgraph), max_distance=h)
-    pruned_subgraph_nodes = np.array(subgraph_nodes)[enclosing_subgraph_nodes].tolist()
-    pruned_labels = labels[enclosing_subgraph_nodes]
-    if max_node_label_value is not None:
-        pruned_labels = np.array([np.minimum(label, max_node_label_value).tolist() for label in pruned_labels])
-    return pruned_subgraph_nodes, pruned_labels
-
+# Note: subgraph_extraction_labeling is imported from subgraph_extraction.graph_sampler
+# We still need node_label here for prepare_features
 def node_label(subgraph, max_distance=1):
     roots = [0, 1]
     sgs_single_root = [remove_nodes(subgraph, [root]) for root in roots]
@@ -121,22 +69,46 @@ def prepare_features(subgraph, n_labels, max_n_label, n_feats=None):
     subgraph.ndata['id'] = torch.FloatTensor(n_ids)
     return subgraph
 
-def get_subgraphs(links, adj_list, dgl_adj_list, max_node_label_value, node_features=None, kge_entity2id=None):
+def get_subgraphs(links, adj_list, dgl_adj_list, max_node_label_value, params, node_features=None, kge_entity2id=None):
+    """Extract subgraphs for a batch of links.
+
+    Note: This function is a performance bottleneck. The main issue is that
+    subgraph_extraction_labeling() recomputes the incidence matrix for each link,
+    which is extremely wasteful. However, we cannot modify the imported function.
+
+    TODO: Consider creating a custom optimized version that pre-computes incidence matrix.
+    """
     subgraphs = []
     r_labels = []
     for link in links:
         head, tail, rel = link[0], link[1], link[2]
-        nodes, node_labels = subgraph_extraction_labeling((head, tail), rel, adj_list, h=params_.hop, enclosing_sub_graph=params_.enclosing_sub_graph, max_node_label_value=max_node_label_value)
-        subgraph = dgl.DGLGraph(dgl_adj_list.subgraph(nodes))
-        subgraph.edata['type'] = dgl_adj_list.edata['type'][dgl_adj_list.subgraph(nodes).parent_eid]
+        # subgraph_extraction_labeling returns 5 values: nodes, labels, subgraph_size, enc_ratio, num_pruned_nodes
+        # WARNING: This function recomputes incidence matrix each time (slow!)
+        nodes, node_labels, _, _, _ = subgraph_extraction_labeling((head, tail), rel, adj_list, h=params.hop, enclosing_sub_graph=params.enclosing_sub_graph, max_node_label_value=max_node_label_value)
+
+        # DGL 2.2.1: Use node_subgraph instead of deprecated subgraph API
+        subgraph_nodes_tensor = torch.LongTensor(nodes)
+        subgraph = dgl.node_subgraph(dgl_adj_list, subgraph_nodes_tensor)
+
+        # Copy edge types from parent graph
+        subgraph.edata['type'] = dgl_adj_list.edata['type'][subgraph.edata[dgl.EID]]
         subgraph.edata['label'] = torch.tensor(rel * np.ones(subgraph.edata['type'].shape), dtype=torch.long)
-        edges_btw_roots = subgraph.edge_id(0, 1)
-        rel_link = np.nonzero(subgraph.edata['type'][edges_btw_roots] == rel)
-        if rel_link.squeeze().nelement() == 0:
-            subgraph.add_edge(0, 1)
+
+        # Check if edge exists between roots (handle case where edge doesn't exist)
+        try:
+            # DGL 2.2.1: Use edge_ids (plural) instead of edge_id
+            edges_btw_roots = subgraph.edge_ids(0, 1)
+            rel_link = np.nonzero(subgraph.edata['type'][edges_btw_roots] == rel)
+            if rel_link.squeeze().nelement() == 0:
+                subgraph.add_edges(0, 1)
+                subgraph.edata['type'][-1] = torch.tensor(rel).type(torch.LongTensor)
+                subgraph.edata['label'][-1] = torch.tensor(rel).type(torch.LongTensor)
+        except:
+            # Edge doesn't exist between node 0 and 1, add it
+            subgraph.add_edges(0, 1)
             subgraph.edata['type'][-1] = torch.tensor(rel).type(torch.LongTensor)
             subgraph.edata['label'][-1] = torch.tensor(rel).type(torch.LongTensor)
-        
+
         # This part is simplified, assuming no kge_embeddings for now
         n_feats = None
         subgraph = prepare_features(subgraph, node_labels, max_node_label_value, n_feats)
@@ -147,90 +119,174 @@ def get_subgraphs(links, adj_list, dgl_adj_list, max_node_label_value, node_feat
     return (batched_graph, r_labels)
 
 def main(params):
+    # Setup device (GPU if available)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logging.info('=' * 80)
+    logging.info(f'Device: {device}')
+
     # Load trained GraIL model
+    logging.info(f'Loading trained GraIL model from: {params.experiment_name}')
     model_path = os.path.join('experiments', params.experiment_name, 'best_graph_classifier.pth')
-    model = torch.load(model_path, map_location='cpu')
+    model = torch.load(model_path, map_location=device)
+    model.to(device)
     model.eval()
+    logging.info(f'✓ Model loaded successfully')
 
     # Load graph structure for subgraph extraction
     # NOTE: This assumes the 'ogbl-biokg' data has been converted to .txt files in data/ogbl-biokg
+    logging.info(f'Loading graph structure for subgraph extraction...')
     db_path = os.path.join('./data', params.dataset)
     train_path = os.path.join(db_path, 'train.txt')
-    
+
     # We only need the training graph to build the adjacencies for subgraph extraction
-    files = {'graph': train_path}
+    # NOTE: Must use 'train' key because utils/data_utils.process_files expects it
+    files = {'train': train_path}
     adj_list, dgl_adj_list, _, _, _, _ = process_files(files, model.relation2id, params.add_traspose_rels)
+    logging.info(f'✓ Graph structure loaded successfully')
 
     # Load OGB dataset and evaluator
+    logging.info(f'Loading OGB dataset: {params.dataset}...')
     dataset = LinkPropPredDataset(name='ogbl-biokg', root=params.ogb_root)
     split_edge = dataset.get_edge_split()
     evaluator = Evaluator(name='ogbl-biokg')
+    logging.info(f'✓ OGB dataset loaded successfully')
 
     # Select the split to evaluate
     if params.split == 'valid':
-        source_nodes = split_edge['valid']['head']
-        relation_types = split_edge['valid']['relation']
-        target_nodes = split_edge['valid']['tail']
-        target_nodes_neg = split_edge['valid']['tail_neg']
+        split_data = split_edge['valid']
     elif params.split == 'test':
-        source_nodes = split_edge['test']['head']
-        relation_types = split_edge['test']['relation']
-        target_nodes = split_edge['test']['tail']
-        target_nodes_neg = split_edge['test']['tail_neg']
+        split_data = split_edge['test']
     else:
         raise ValueError('Split not recognized: must be "valid" or "test"')
 
-    pos_preds = []
-    neg_preds = []
+    # Optionally use only a subset of samples for faster evaluation
+    total_samples = len(split_data['head'])
+    if params.num_samples is not None and params.num_samples < total_samples:
+        logging.info(f'Using subset of {params.num_samples:,} samples out of {total_samples:,} for faster evaluation')
+        import numpy as np
+        indices = np.random.choice(total_samples, params.num_samples, replace=False)
+        split_data = {
+            'head': split_data['head'][indices],
+            'tail': split_data['tail'][indices],
+            'relation': split_data['relation'][indices],
+            'head_neg': split_data['head_neg'][indices],
+            'tail_neg': split_data['tail_neg'][indices]
+        }
 
-    # Initialize worker for multiprocessing
-    intialize_worker(model, adj_list, dgl_adj_list, params, None, None)
+    # Dataset statistics
+    num_samples = len(split_data['head'])
+    num_neg_per_sample = split_data['tail_neg'].shape[1]
+    logging.info('=' * 80)
+    logging.info(f'Evaluation Configuration:')
+    logging.info(f'  Split: {params.split}')
+    logging.info(f'  Number of samples: {num_samples:,}')
+    logging.info(f'  Negative samples per link: {num_neg_per_sample}')
+    logging.info(f'  Total predictions per mode: {num_samples * (1 + num_neg_per_sample):,}')
+    logging.info(f'  Hop: {params.hop}, Max nodes per hop: {params.max_nodes_per_hop}')
+    logging.info('=' * 80)
 
-    # Using a smaller batch size for evaluation to avoid memory issues
-    eval_batch_size = 16 
-    
-    with mp.Pool(processes=None, initializer=intialize_worker, initargs=(model, adj_list, dgl_adj_list, params, None, None)) as p:
-        for i in tqdm(range(0, len(source_nodes), eval_batch_size)):
+    # Batch size for evaluation - larger is faster but uses more memory
+    # With GPU: can use 64-128, with CPU: use 16-32
+    if params.eval_batch_size is not None:
+        eval_batch_size = params.eval_batch_size
+    else:
+        eval_batch_size = 64 if device.type == 'cuda' else 16
+    logging.info(f'  Eval batch size: {eval_batch_size}')
+
+    # Evaluate both head-batch and tail-batch modes (like OGB baseline)
+    modes = ['tail-batch', 'head-batch']
+    all_pos_preds = []
+    all_neg_preds = []
+
+    for mode in modes:
+        logging.info(f'\n>>> Starting {mode} evaluation...')
+        pos_preds = []
+        neg_preds = []
+
+        # Get data for current mode
+        if mode == 'tail-batch':
+            # Predict tail: (head, relation, ?)
+            source_nodes = split_data['head']
+            target_nodes = split_data['tail']
+            target_nodes_neg = split_data['tail_neg']
+        else:  # head-batch
+            # Predict head: (?, relation, tail)
+            source_nodes = split_data['tail']  # Swap: tail becomes source
+            target_nodes = split_data['head']  # Swap: head becomes target
+            target_nodes_neg = split_data['head_neg']
+
+        relation_types = split_data['relation']
+
+        for i in tqdm(range(0, len(source_nodes), eval_batch_size), desc=f'{mode:12s}', ncols=100):
             batch_src = source_nodes[i:i+eval_batch_size]
             batch_rel = relation_types[i:i+eval_batch_size]
             batch_tgt = target_nodes[i:i+eval_batch_size]
             batch_tgt_neg = target_nodes_neg[i:i+eval_batch_size]
 
-            pos_links = np.array([batch_src, batch_tgt, batch_rel]).T
-            
             # Create a list of all links to score in this batch
             all_links_to_score = []
             for j in range(len(batch_src)):
-                # Add positive link
-                all_links_to_score.append((batch_src[j], batch_tgt[j], batch_rel[j]))
-                # Add negative links
-                for neg_tail in batch_tgt_neg[j]:
-                    all_links_to_score.append((batch_src[j], neg_tail, batch_rel[j]))
+                # For tail-batch: (head, tail, rel)
+                # For head-batch: (tail, head, rel) - will be swapped back in scoring
+                if mode == 'tail-batch':
+                    # Add positive link
+                    all_links_to_score.append((batch_src[j], batch_tgt[j], batch_rel[j]))
+                    # Add negative links (corrupted tails)
+                    for neg_tail in batch_tgt_neg[j]:
+                        all_links_to_score.append((batch_src[j], neg_tail, batch_rel[j]))
+                else:  # head-batch
+                    # Add positive link (swap back to original order)
+                    all_links_to_score.append((batch_tgt[j], batch_src[j], batch_rel[j]))
+                    # Add negative links (corrupted heads)
+                    for neg_head in batch_tgt_neg[j]:
+                        all_links_to_score.append((neg_head, batch_src[j], batch_rel[j]))
 
             # Get subgraphs and scores
-            data, _ = get_subgraphs(all_links_to_score, adj_list, dgl_adj_list, model.gnn.max_label_value)
+            data, _ = get_subgraphs(all_links_to_score, adj_list, dgl_adj_list, model.gnn.max_label_value, params)
+
+            # Move data to device (GPU if available)
+            data = data.to(device)
+
             with torch.no_grad():
                 scores = model(data)
 
             # Reshape scores and append to lists
-            scores = scores.view(len(batch_src), -1) # Shape: (eval_batch_size, 1 + num_neg) 
+            scores = scores.view(len(batch_src), -1)  # Shape: (eval_batch_size, 1 + num_neg)
             pos_preds.append(scores[:, 0])
             neg_preds.append(scores[:, 1:])
 
-    # Concatenate all predictions and evaluate
-    pos_pred = torch.cat(pos_preds, dim=0)
-    neg_pred = torch.cat(neg_preds, dim=0)
-    
+        # Concatenate predictions for this mode
+        mode_pos = torch.cat(pos_preds, dim=0)
+        mode_neg = torch.cat(neg_preds, dim=0)
+        all_pos_preds.append(mode_pos)
+        all_neg_preds.append(mode_neg)
+        logging.info(f'✓ {mode} completed: {len(mode_pos):,} predictions generated')
+
+    # Concatenate predictions from both modes (head-batch and tail-batch)
+    logging.info('\n>>> Aggregating predictions from both modes...')
+    pos_pred = torch.cat(all_pos_preds, dim=0)
+    neg_pred = torch.cat(all_neg_preds, dim=0)
+
+    logging.info(f'✓ Total predictions: {len(pos_pred):,}')
+    logging.info(f'  - tail-batch: {len(all_pos_preds[0]):,} predictions')
+    logging.info(f'  - head-batch: {len(all_pos_preds[1]):,} predictions')
+
+    # Compute metrics
+    logging.info('\n>>> Computing evaluation metrics...')
     input_dict = {
         'y_pred_pos': pos_pred,
         'y_pred_neg': neg_pred,
     }
-    
+
     result = evaluator.eval(input_dict)
-    
-    logging.info(f'Results on {params.split} split:')
+
+    # Print results
+    logging.info('=' * 80)
+    logging.info(f'FINAL RESULTS ON {params.split.upper()} SPLIT:')
+    logging.info('=' * 80)
     for key, value in result.items():
-        logging.info(f'{key}: {value}')
+        logging.info(f'  {key:20s}: {value:.6f}')
+    logging.info('=' * 80)
 
 
 if __name__ == '__main__':
@@ -248,6 +304,10 @@ if __name__ == '__main__':
     parser.add_argument('--add_traspose_rels', '-tr', type=bool, default=False, help='Whether to append adj matrix list with symmetric relations.')
     parser.add_argument('--enclosing_sub_graph', '-en', type=bool, default=True, help='whether to only consider enclosing subgraph')
     parser.add_argument("--max_nodes_per_hop", "-max_h", type=int, default=None, help="if > 0, upper bound the # nodes per hop by subsampling")
+
+    # Evaluation optimization params
+    parser.add_argument("--num_samples", "-n", type=int, default=None, help="Number of samples to evaluate (if None, use all samples). For faster testing, use e.g. 1000")
+    parser.add_argument("--eval_batch_size", "-bs", type=int, default=None, help="Batch size for evaluation (if None, auto-set: 64 for GPU, 16 for CPU)")
 
     params = parser.parse_args()
     main(params)

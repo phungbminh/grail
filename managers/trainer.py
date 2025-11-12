@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from sklearn import metrics
 
@@ -32,7 +33,7 @@ class Trainer():
         if params.optimizer == "Adam":
             self.optimizer = optim.Adam(model_params, lr=params.lr, weight_decay=self.params.l2)
 
-        self.criterion = nn.MarginRankingLoss(self.params.margin, reduction='sum')
+        self.criterion = nn.MarginRankingLoss(self.params.margin, reduction='mean')
 
         self.reset_training_state()
 
@@ -47,15 +48,35 @@ class Trainer():
         all_labels = []
         all_scores = []
 
-        dataloader = DataLoader(self.train_data, batch_size=self.params.batch_size, shuffle=True, num_workers=self.params.num_workers, collate_fn=self.params.collate_fn)
+        # Reduce workers to save RAM during debugging
+        num_workers = 0  # Force single-threaded to reduce RAM
+        dataloader = DataLoader(self.train_data,
+                              batch_size=self.params.batch_size,
+                              shuffle=True,
+                              num_workers=num_workers,
+                              collate_fn=self.params.collate_fn,
+                              pin_memory=torch.cuda.is_available())
         self.graph_classifier.train()
         model_params = list(self.graph_classifier.parameters())
-        for b_idx, batch in enumerate(dataloader):
+
+        # Add progress bar for training
+        pbar = tqdm(dataloader, desc=f"Training Epoch", leave=False)
+        for b_idx, batch in enumerate(pbar):
             data_pos, targets_pos, data_neg, targets_neg = self.params.move_batch_to_device(batch, self.params.device)
+
+            # Clear cache before forward pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             self.optimizer.zero_grad()
             score_pos = self.graph_classifier(data_pos)
             score_neg = self.graph_classifier(data_neg)
-            loss = self.criterion(score_pos, score_neg.view(len(score_pos), -1).mean(dim=1), torch.Tensor([1]).to(device=self.params.device))
+            # Fix dimension mismatch: all tensors should have shape [batch_size]
+            loss = self.criterion(
+                score_pos.squeeze(1),  # [batch, 1] -> [batch]
+                score_neg.view(len(score_pos), -1).mean(dim=1),  # [batch]
+                torch.ones(len(score_pos)).to(device=self.params.device)  # [batch]
+            )
             # print(score_pos, score_neg, loss)
             loss.backward()
             self.optimizer.step()
@@ -66,8 +87,12 @@ class Trainer():
                 all_labels += targets_pos.tolist() + targets_neg.tolist()
                 total_loss += loss
 
+            # Update progress bar with current loss
+            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'batch': b_idx})
+
             if self.valid_evaluator and self.params.eval_every_iter and self.updates_counter % self.params.eval_every_iter == 0:
                 tic = time.time()
+
                 result = self.valid_evaluator.eval()
                 logging.info('\nPerformance:' + str(result) + 'in ' + str(time.time() - tic))
 
@@ -102,7 +127,7 @@ class Trainer():
             # if self.valid_evaluator and epoch % self.params.eval_every == 0:
             #     result = self.valid_evaluator.eval()
             #     logging.info('\nPerformance:' + str(result))
-            
+
             #     if result['auc'] >= self.best_metric:
             #         self.save_classifier()
             #         self.best_metric = result['auc']

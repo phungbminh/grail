@@ -20,10 +20,25 @@ def main(params):
     simplefilter(action='ignore', category=UserWarning)
     simplefilter(action='ignore', category=SparseEfficiencyWarning)
 
-    params.db_path = os.path.join(params.main_dir, f'data/{params.dataset}/subgraphs_en_{params.enclosing_sub_graph}_neg_{params.num_neg_samples_per_link}_hop_{params.hop}')
+    # Include max_nodes_per_hop and semantic pruning in cache path to avoid using wrong cache
+    max_nodes_str = f"_maxnodes_{params.max_nodes_per_hop}" if params.max_nodes_per_hop else ""
+    semantic_str = ""
+    if hasattr(params, 'use_semantic_pruning') and params.use_semantic_pruning:
+        semantic_str = f"_semantic_pruning_sr{params.stage1_ratio}_pw{params.path_weight}_sw{params.semantic_weight}_tss{params.target_subgraph_size}"
 
+    params.db_path = os.path.join(
+        params.main_dir,
+        f'data/{params.dataset}/subgraphs_en_{params.enclosing_sub_graph}_neg_{params.num_neg_samples_per_link}_hop_{params.hop}{max_nodes_str}{semantic_str}'
+    )
+
+    # Check if cache exists, if not create new one
     if not os.path.isdir(params.db_path):
+        logging.info(f"Cache not found at {params.db_path}")
+        logging.info(f"Generating new subgraph dataset...")
         generate_subgraph_datasets(params)
+        logging.info(f"Subgraph dataset generated successfully!")
+    else:
+        logging.info(f"Using existing cache at {params.db_path}")
 
     train = SubgraphDataset(params.db_path, 'train_pos', 'train_neg', params.file_paths,
                             add_traspose_rels=params.add_traspose_rels,
@@ -42,6 +57,29 @@ def main(params):
 
     # Log the max label value to save it in the model. This will be used to cap the labels generated on test set.
     params.max_label_value = train.max_n_label
+
+    # DEBUG: Check edge types in first few subgraphs to validate aug_num_rels
+    print(f"[DEBUG] Dataset stats: num_rels={params.num_rels}, aug_num_rels={params.aug_num_rels}")
+    print(f"[DEBUG] Sample subgraph edge types:")
+    for i in range(min(3, len(train))):
+        subgraph_pos, _, _, subgraphs_neg, _, _ = train[i]
+        pos_edge_types = subgraph_pos.edata['type']
+        neg_edge_types = [g.edata['type'] for g in subgraphs_neg]
+
+        print(f"  Subgraph {i}: pos max type={pos_edge_types.max().item() if len(pos_edge_types) > 0 else 0}, "
+              f"neg max types={[t.max().item() if len(t) > 0 else 0 for t in neg_edge_types]}")
+
+        # Check if any edge type exceeds aug_num_rels
+        if len(pos_edge_types) > 0 and pos_edge_types.max() >= params.aug_num_rels:
+            print(f"[ERROR] Positive edge type exceeds aug_num_rels!")
+            print(f"  Max edge type: {pos_edge_types.max().item()}, aug_num_rels: {params.aug_num_rels}")
+            raise ValueError(f"Edge type {pos_edge_types.max().item()} >= aug_num_rels {params.aug_num_rels}")
+
+        for j, neg_types in enumerate(neg_edge_types):
+            if len(neg_types) > 0 and neg_types.max() >= params.aug_num_rels:
+                print(f"[ERROR] Negative edge type exceeds aug_num_rels!")
+                print(f"  Max edge type: {neg_types.max().item()}, aug_num_rels: {params.aug_num_rels}")
+                raise ValueError(f"Edge type {neg_types.max().item()} >= aug_num_rels {params.aug_num_rels}")
 
     graph_classifier = initialize_model(params, dgl_model, params.load_model)
 
@@ -148,6 +186,30 @@ if __name__ == '__main__':
                         help='whether to concatenate head/tail embedding with pooled graph representation')
     parser.add_argument('--has_attn', '-attn', type=bool, default=True,
                         help='whether to have attn in model or not')
+
+    # Graph pooling params
+    parser.add_argument('--pool_type', '-pool', type=str, default='mean',
+                        choices=['mean', 'sum', 'max', 'attention', 'query_attention'],
+                        help='graph pooling strategy: mean, sum, max, attention (global), query_attention (head/tail conditioned)')
+    parser.add_argument('--pool_heads', '-ph', type=int, default=1,
+                        help='number of attention heads for attention pooling (default: 1, recommended: 4 for multi-head)')
+    parser.add_argument('--pool_dropout', '-pd', type=float, default=0.0,
+                        help='dropout rate for attention pooling (default: 0.0, recommended: 0.1-0.2 for attention)')
+
+    # Semantic pruning params
+    parser.add_argument('--use_semantic_pruning', '-sp', action='store_true',
+                        help='enable Two-Stage Semantic Pruning for subgraph extraction')
+    parser.add_argument('--semantic_embeddings_path', '-sep', type=str, default=None,
+                        help='path to pre-trained semantic embeddings (e.g., TransE entity embeddings)')
+    parser.add_argument('--stage1_ratio', '-sr', type=int, default=10,
+                        help='ratio for Stage 1 pruning (target_M * stage1_ratio nodes kept after Stage 1)')
+    parser.add_argument('--path_weight', '-pw', type=float, default=0.6,
+                        help='weight for path length scores in Stage 2 (alpha)')
+    parser.add_argument('--semantic_weight', '-sw', type=float, default=0.4,
+                        help='weight for semantic similarity scores in Stage 2 (beta)')
+    parser.add_argument('--target_subgraph_size', '-tss', type=int, default=1000,
+                        help='target subgraph size after pruning (M)')
+
 
     params = parser.parse_args()
     initialize_experiment(params, __file__)

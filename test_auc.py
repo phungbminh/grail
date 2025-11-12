@@ -30,7 +30,13 @@ def main(params):
     auc_pr_mean = 0
     for r in range(1, params.runs + 1):
 
-        params.db_path = os.path.join(params.main_dir, f'data/{params.dataset}/test_subgraphs_{params.experiment_name}_{params.constrained_neg_prob}_en_{params.enclosing_sub_graph}')
+        # Include max_nodes_per_hop and semantic pruning in cache path to avoid using wrong cache
+        max_nodes_str = f"_maxnodes_{params.max_nodes_per_hop}" if params.max_nodes_per_hop else ""
+        semantic_str = ""
+        if hasattr(params, 'use_semantic_pruning') and params.use_semantic_pruning:
+            semantic_str = f"_semantic_pruning_sr{params.stage1_ratio}_pw{params.path_weight}_sw{params.semantic_weight}_tss{params.target_subgraph_size}"
+
+        params.db_path = os.path.join(params.main_dir, f'data/{params.dataset}/test_subgraphs_{params.experiment_name}_{params.constrained_neg_prob}_en_{params.enclosing_sub_graph}_neg_{params.num_neg_samples_per_link}_hop_{params.hop}{max_nodes_str}{semantic_str}')
 
         generate_subgraph_datasets(params, splits=['test'],
                                    saved_relation2id=graph_classifier.relation2id,
@@ -106,6 +112,29 @@ if __name__ == '__main__':
                         help='whether to append adj matrix list with symmetric relations')
     parser.add_argument('--enclosing_sub_graph', '-en', type=bool, default=True,
                         help='whether to only consider enclosing subgraph')
+
+    # Graph pooling params
+    parser.add_argument('--pool_type', '-pool', type=str, default='mean',
+                        choices=['mean', 'sum', 'max', 'attention', 'query_attention'],
+                        help='graph pooling strategy: mean, sum, max, attention (global), query_attention (head/tail conditioned)')
+    parser.add_argument('--pool_heads', '-ph', type=int, default=1,
+                        help='number of attention heads for attention pooling (default: 1, recommended: 4 for multi-head)')
+    parser.add_argument('--pool_dropout', '-pd', type=float, default=0.0,
+                        help='dropout rate for attention pooling (default: 0.0, recommended: 0.1-0.2 for attention)')
+
+    # Semantic pruning params
+    parser.add_argument('--use_semantic_pruning', '-sp', action='store_true',
+                        help='enable Two-Stage Semantic Pruning for subgraph extraction')
+    parser.add_argument('--semantic_embeddings_path', '-sep', type=str, default=None,
+                        help='path to pre-trained semantic embeddings (e.g., TransE entity embeddings)')
+    parser.add_argument('--stage1_ratio', '-sr', type=int, default=10,
+                        help='ratio for Stage 1 pruning (target_M * stage1_ratio nodes kept after Stage 1)')
+    parser.add_argument('--path_weight', '-pw', type=float, default=0.6,
+                        help='weight for path length scores in Stage 2 (alpha)')
+    parser.add_argument('--semantic_weight', '-sw', type=float, default=0.4,
+                        help='weight for semantic similarity scores in Stage 2 (beta)')
+    parser.add_argument('--target_subgraph_size', '-tss', type=int, default=1000,
+                        help='target subgraph size after pruning (M)')
 
     params = parser.parse_args()
     initialize_experiment(params, __file__)
