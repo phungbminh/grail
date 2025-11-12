@@ -1,12 +1,88 @@
+# macOS
 .DS_Store
-__pycache__/
-tmp.txt
-experiments/
 
-#Saved and downloaded data files
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+*.ipynb
+.ipynb_checkpoints/
+
+# Experiments and logs
+experiments/
+tmp.txt
+*.log
+
+# Data files and caches
 *.nt.gz
 *.npz
 *.pkl
-*.ipynb
+*.pickle
 *.npy
-*.pyc
+
+# Dataset directories (keep structure but ignore large data files)
+data/*/dataset/
+data/*/subgraphs_*/
+data/*/*.txt
+data/*/*.dict
+data/*/entity_dict.json
+
+# Specific large datasets (versioned datasets)
+data/FB15K237/
+data/NELL-995/
+data/WN18RR*/
+data/fb237_*/
+data/nell_*/
+
+# Analysis results
+analysis_results_*/
+dataset/
+
+# Backup directories
+backup/
+
+# LaTeX generated files
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+
+# Model checkpoints (if large)
+*.pth
+*.pt
+*.ckpt
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+train_command.txt
+glm.sh
+
+# Generated analysis files (keep scripts, ignore outputs)
+relations_list.txt
+biokg_relations_mapping.tex
+
+# Nested git repositories
+reference/ogb/
