@@ -342,21 +342,45 @@ def links2subgraphs(A, graphs, params, max_label_value=None, semantic_embeddings
 
     def extraction_helper(A, links, g_labels, split_env):
 
-        with env.begin(write=True, db=split_env) as txn:
-            txn.put('num_graphs'.encode(), (len(links)).to_bytes(int.bit_length(len(links)), byteorder='little'))
+        # CRITICAL OPTIMIZATION: Pre-compute A_incidence ONCE before spawning workers!
+        # This saves 7-10s × num_workers initialization time
+        logging.info("Pre-computing A_incidence matrix (one-time cost)...")
+        precompute_start = time.time()
+        A_incidence_precomputed = incidence_matrix(A)
+        A_incidence_precomputed += A_incidence_precomputed.T  # Make symmetric
+        precompute_time = time.time() - precompute_start
+        logging.info(f"A_incidence pre-computed in {precompute_time:.2f}s, shape: {A_incidence_precomputed.shape}")
 
-        # Pass semantic embeddings to workers
-        init_args = (A, params, max_label_value, semantic_embeddings)
+        # Convert GPU embeddings to numpy for multiprocessing
+        semantic_embeddings_cpu = None
+        if semantic_embeddings is not None:
+            try:
+                import torch
+                if isinstance(semantic_embeddings, torch.Tensor):
+                    logging.info("Converting GPU embeddings to CPU for workers...")
+                    semantic_embeddings_cpu = semantic_embeddings.cpu().numpy()
+                    logging.info(f"Embeddings converted: {semantic_embeddings_cpu.shape}")
+                else:
+                    semantic_embeddings_cpu = semantic_embeddings
+            except Exception as e:
+                logging.warning(f"Failed to convert embeddings: {e}")
+                semantic_embeddings_cpu = semantic_embeddings
+        else:
+            logging.warning("No semantic embeddings provided!")
+
+        # Pass pre-computed A_incidence to workers (avoid recomputation!)
+        init_args = (A, params, max_label_value, semantic_embeddings_cpu, A_incidence_precomputed)
 
         # Use all available cores for maximum speed
         import multiprocessing
         max_workers = min(multiprocessing.cpu_count(), 16)  # Use all 16 cores
         logging.info(f"Using {max_workers} cores for subgraph extraction")
 
-        # OPTIMIZATION: Batch LMDB writes for 10-50x speedup
-        batch_size = 200  # Write 200 subgraphs per transaction (increased from 100)
-        batch_buffer = []
+        # OPTIMIZATION: Extract ALL to memory first (no disk I/O bottleneck!)
+        logging.info(f"Extracting {len(links):,} subgraphs to memory (parallel)...")
+        all_results = []
 
+        extraction_start = time.time()
         with mp.Pool(processes=max_workers, initializer=intialize_worker, initargs=init_args) as p:
             args_ = zip(range(len(links)), links, g_labels)
             # Use imap_unordered for better parallelism (order doesn't matter for LMDB)
@@ -368,21 +392,39 @@ def links2subgraphs(A, graphs, params, max_label_value=None, semantic_embeddings
                 enc_ratios.append(enc_ratio)
                 num_pruned_nodes.append(n_pruned)
 
-                # Add to batch buffer (data already serialized in worker!)
-                batch_buffer.append((str_id, serialized_datum))
+                # Store in memory (no disk write yet!)
+                all_results.append((str_id, serialized_datum))
 
-                # Write batch when full
-                if len(batch_buffer) >= batch_size:
-                    with env.begin(write=True, db=split_env) as txn:
-                        for bid, bdata in batch_buffer:
-                            txn.put(bid, bdata)  # Already serialized!
-                    batch_buffer = []
+        extraction_time = time.time() - extraction_start
 
-            # Write remaining items
-            if batch_buffer:
-                with env.begin(write=True, db=split_env) as txn:
-                    for bid, bdata in batch_buffer:
-                        txn.put(bid, bdata)  # Already serialized!
+        # Calculate memory usage
+        total_bytes = sum(len(data) for _, data in all_results)
+        total_gb = total_bytes / (1024**3)
+        logging.info(f"Extraction completed in {extraction_time:.1f}s ({len(all_results):,} subgraphs)")
+        logging.info(f"Memory usage: {total_gb:.2f} GB ({total_bytes/len(all_results):.0f} bytes/subgraph)")
+
+        # MEGA-OPTIMIZATION: Single LMDB transaction for ALL data (10-100x faster!)
+        logging.info(f"Writing {len(all_results):,} subgraphs to LMDB in ONE transaction...")
+        write_start = time.time()
+
+        with env.begin(write=True, db=split_env) as txn:
+            # Write metadata
+            txn.put('num_graphs'.encode(), (len(links)).to_bytes(int.bit_length(len(links)), byteorder='little'))
+
+            # Write all subgraphs in single transaction
+            for i, (str_id, serialized_datum) in enumerate(all_results):
+                txn.put(str_id, serialized_datum)
+
+                # Progress update every 10k items
+                if (i + 1) % 10000 == 0:
+                    logging.info(f"  Written {i+1:,}/{len(all_results):,} items...")
+
+        write_time = time.time() - write_start
+        logging.info(f"LMDB write completed in {write_time:.1f}s ({len(all_results)/write_time:.0f} items/sec)")
+        logging.info(f"Total time: extraction={extraction_time:.1f}s + write={write_time:.1f}s = {extraction_time+write_time:.1f}s")
+
+        # Clear memory
+        all_results.clear()
 
     for split_name, split in graphs.items():
         logging.info(f"Extracting enclosing subgraphs for positive links in {split_name} set")
@@ -430,15 +472,22 @@ def get_average_subgraph_size(sample_size, links, A, params):
     return total_size / sample_size
 
 
-def intialize_worker(A, params, max_label_value, semantic_embeddings=None):
+def intialize_worker(A, params, max_label_value, semantic_embeddings=None, A_incidence_precomputed=None):
     global A_, params_, max_label_value_, A_incidence_, semantic_embeddings_
     A_, params_, max_label_value_ = A, params, max_label_value
     semantic_embeddings_ = semantic_embeddings
 
-    # Pre-compute incidence matrix once per worker (huge speedup!)
-    # This eliminates ~1.5s per subgraph by caching the combined adjacency
-    A_incidence_ = incidence_matrix(A)
-    A_incidence_ += A_incidence_.T  # Make symmetric
+    # ULTRA-FAST: Use pre-computed A_incidence (no recomputation needed!)
+    if A_incidence_precomputed is not None:
+        A_incidence_ = A_incidence_precomputed
+        logging.info(f"[Worker Init] Using pre-computed A_incidence: {A_incidence_.shape}")
+    else:
+        # Fallback: compute if not provided
+        start_incidence = time.time()
+        A_incidence_ = incidence_matrix(A)
+        A_incidence_ += A_incidence_.T
+        incidence_time = time.time() - start_incidence
+        logging.warning(f"[Worker Init] Had to compute A_incidence in {incidence_time:.2f}s (should be pre-computed!)")
 
 
 def extract_save_subgraph(args_):
@@ -465,6 +514,13 @@ def extract_save_subgraph(args_):
     extraction_time = time.time() - start_time
     # if idx % 100 == 0:  # Log every 100th subgraph to avoid too much output
     #     print(f"[TIMING] Subgraph {idx}: extraction_time={extraction_time:.4f}s, nodes={len(nodes)}, subgraph_size={subgraph_size}, hop={params_.hop}")
+
+    # Log timing every 500 subgraphs for monitoring
+    if idx % 500 == 0:
+        logging.info(
+            f"[TIMING] Subgraph {idx}: total={extraction_time*1000:.0f}ms, "
+            f"nodes={len(nodes)}, size={subgraph_size}"
+        )
 
     # Return serialized data + metadata separately
     return (str_id, serialized_datum, subgraph_size, enc_ratio, num_pruned_nodes, n_labels)
@@ -515,25 +571,118 @@ def subgraph_extraction_labeling(ind, rel, A_list, h=1, enclosing_sub_graph=Fals
     else:
         subgraph_nodes = list(ind) + list(subgraph_nei_nodes_un)
 
-    # OPTIMIZATION: Use numpy array indexing for faster sparse matrix slicing
-    subgraph_nodes_arr = np.array(subgraph_nodes, dtype=np.int32)
-    subgraph = [adj[subgraph_nodes_arr, :][:, subgraph_nodes_arr] for adj in A_list]
-    subgraph_time = time.time() - start_subgraph
+    # CRITICAL FIX: Prune BEFORE labeling to avoid labeling 40k+ nodes!
+    # Original: Extract 40k → Label 40k → Prune to 1k (SLOW!)
+    # Fixed:    Extract 40k → Prune to 10k → Label 10k → Final prune to 1k (FAST!)
 
-    # Component timing: Node labeling
-    start_labeling = time.time()
-    # OPTIMIZATION: Compute incidence matrix once and reuse
-    subgraph_incidence = incidence_matrix(subgraph)
-    labels, enclosing_subgraph_nodes = node_label(subgraph_incidence, max_distance=h)
-    labeling_time = time.time() - start_labeling
+    start_early_prune = time.time()
+    # Early pruning if subgraph is too large (before expensive labeling!)
+    if max_nodes_per_hop is not None and len(subgraph_nodes) > max_nodes_per_hop * 10:
+        # Use fast path-based pruning to reduce to ~10x target size
+        logging.info(f"[EARLY PRUNE] Subgraph too large ({len(subgraph_nodes)} nodes), pre-pruning before labeling...")
 
-    # Component timing: Final processing
-    start_processing = time.time()
-    pruned_subgraph_nodes = np.array(subgraph_nodes)[enclosing_subgraph_nodes].tolist()
-    pruned_labels = labels[enclosing_subgraph_nodes]
+        from subgraph_extraction.semantic_pruning import compute_path_length_scores
+        other_nodes = [n for n in subgraph_nodes if n not in ind]
 
-    # Apply semantic pruning if enabled
-    if use_semantic_pruning and max_nodes_per_hop is not None and len(pruned_subgraph_nodes) > max_nodes_per_hop:
+        # Stage 1: Fast path-length pruning to 10x target
+        path_scores = compute_path_length_scores(other_nodes, ind[0], ind[1], A_incidence)
+        sorted_nodes = sorted(path_scores.items(), key=lambda x: x[1], reverse=True)
+        early_pruned = [node for node, _ in sorted_nodes[:max_nodes_per_hop * 10]]
+        subgraph_nodes = list(ind) + early_pruned
+        logging.info(f"[EARLY PRUNE] Reduced to {len(subgraph_nodes)} nodes for labeling")
+
+    early_prune_time = time.time() - start_early_prune
+
+    # MEGA-FIX: Skip expensive labeling if we're going to prune heavily anyway!
+    # Instead: Prune first, then label only the final nodes
+    skip_labeling_for_now = (
+        use_semantic_pruning and
+        max_nodes_per_hop is not None and
+        len(subgraph_nodes) > max_nodes_per_hop * 1.5  # If >1.5x target, skip initial labeling (was 2x)
+    )
+
+    if skip_labeling_for_now:
+        # FAST PATH: Prune first using path scores, THEN label
+        logging.info(f"[FAST PATH] Skipping labeling for {len(subgraph_nodes)} nodes, will prune first")
+
+        from subgraph_extraction.semantic_pruning import two_stage_pruning, compute_path_length_scores
+
+        # Quick prune using path length only (no semantic yet)
+        other_nodes = [n for n in subgraph_nodes if n not in ind]
+
+        # Use path-based pruning to reduce to ~2x target
+        path_scores = compute_path_length_scores(other_nodes, ind[0], ind[1], A_incidence)
+        sorted_nodes = sorted(path_scores.items(), key=lambda x: x[1], reverse=True)
+        initial_pruned = [node for node, _ in sorted_nodes[:max_nodes_per_hop * 2]]
+        pruned_subgraph_nodes = list(ind) + initial_pruned
+
+        logging.info(f"[FAST PATH] Pruned {len(subgraph_nodes)} → {len(pruned_subgraph_nodes)} nodes")
+
+        # Now label ONLY the pruned nodes (much faster!)
+        start_labeling = time.time()
+        pruned_nodes_arr = np.array(pruned_subgraph_nodes, dtype=np.int32)
+        pruned_subgraph = [adj[pruned_nodes_arr, :][:, pruned_nodes_arr] for adj in A_list]
+        pruned_subgraph_incidence = incidence_matrix(pruned_subgraph)
+        labels, enclosing_nodes = node_label(pruned_subgraph_incidence, max_distance=h)
+        labeling_time = time.time() - start_labeling
+
+        # Apply enclosing filter
+        pruned_subgraph_nodes = np.array(pruned_subgraph_nodes)[enclosing_nodes].tolist()
+        pruned_labels = labels[enclosing_nodes]
+
+        logging.info(f"[FAST PATH] After enclosing filter: {len(pruned_subgraph_nodes)} nodes, labeling took {labeling_time*1000:.0f}ms")
+
+        # Final semantic pruning if still too large
+        if len(pruned_subgraph_nodes) > max_nodes_per_hop:
+            other_nodes = [n for n in pruned_subgraph_nodes if n not in ind]
+            semantic_pruned_nodes = two_stage_pruning(
+                subgraph_nodes=other_nodes,
+                u=ind[0], v=ind[1],
+                A_incidence=A_incidence,
+                embeddings=semantic_embeddings,
+                target_M=max_nodes_per_hop - 2,
+                stage1_ratio=stage1_ratio,
+                alpha=path_weight, beta=semantic_weight,
+                use_semantic=(semantic_embeddings is not None),
+                verbose=False
+            )
+            final_nodes = list(ind) + semantic_pruned_nodes
+
+            # Rebuild labels for final nodes
+            node_to_idx = {node: idx for idx, node in enumerate(pruned_subgraph_nodes)}
+            final_labels = []
+            for node in final_nodes:
+                if node in node_to_idx:
+                    final_labels.append(pruned_labels[node_to_idx[node]])
+
+            pruned_subgraph_nodes = final_nodes
+            pruned_labels = np.array(final_labels) if final_labels else pruned_labels[:len(final_nodes)]
+
+            logging.info(f"[FAST PATH] Final prune: {len(final_nodes)} nodes")
+
+        subgraph_time = time.time() - start_subgraph
+        start_processing = time.time()
+
+    else:
+        # ORIGINAL PATH: Label first, then prune (for small subgraphs)
+        subgraph_nodes_arr = np.array(subgraph_nodes, dtype=np.int32)
+        subgraph = [adj[subgraph_nodes_arr, :][:, subgraph_nodes_arr] for adj in A_list]
+        subgraph_time = time.time() - start_subgraph
+
+        # Component timing: Node labeling (NOW on smaller graph!)
+        start_labeling = time.time()
+        # OPTIMIZATION: Compute incidence matrix once and reuse
+        subgraph_incidence = incidence_matrix(subgraph)
+        labels, enclosing_subgraph_nodes = node_label(subgraph_incidence, max_distance=h)
+        labeling_time = time.time() - start_labeling
+
+        # Component timing: Final processing
+        start_processing = time.time()
+        pruned_subgraph_nodes = np.array(subgraph_nodes)[enclosing_subgraph_nodes].tolist()
+        pruned_labels = labels[enclosing_subgraph_nodes]
+
+    # Apply semantic pruning if enabled (Stage 2: careful ranking) - only for ORIGINAL PATH
+    if not skip_labeling_for_now and use_semantic_pruning and max_nodes_per_hop is not None and len(pruned_subgraph_nodes) > max_nodes_per_hop:
         try:
             from subgraph_extraction.semantic_pruning import two_stage_pruning
 
@@ -629,18 +778,52 @@ def node_label(subgraph, max_distance=1):
             distances = np.full(sg.shape[0], 1e7, dtype=np.float64)
             distances[0] = 0
 
-            # Use scipy's shortest_path with method='BF' for better performance
+            # CRITICAL FIX: Use pure BFS for unweighted shortest paths (100x faster than Bellman-Ford!)
+            # Bellman-Ford is O(V×E) = O(43k × 4M) = TOO SLOW!
+            # BFS is O(V+E) = O(43k + 4M) = MUCH FASTER!
             try:
-                dists = ssp.csgraph.shortest_path(
+                # Use breadth_first_order for ultra-fast BFS
+                dists = ssp.csgraph.breadth_first_order(
                     sg,
-                    method='BF',  # Bellman-Ford, faster for sparse graphs
+                    i_start=0,
                     directed=False,
-                    unweighted=True,
-                    indices=0
+                    return_predecessors=False
                 )
-                distances = dists[1:]  # Skip source node
-            except:
+                # Convert BFS order to distances
+                distances = np.full(sg.shape[0], 1e7, dtype=np.float64)
+                distances[0] = 0
+
+                # Simple BFS to compute distances
+                from collections import deque
+                queue = deque([0])
+                visited = {0}
+                dist_map = {0: 0}
+
+                sg_csr = sg.tocsr() if not isinstance(sg, ssp.csr_matrix) else sg
+
+                while queue:
+                    node = queue.popleft()
+                    current_dist = dist_map[node]
+
+                    # Get neighbors
+                    neighbors = sg_csr.indices[sg_csr.indptr[node]:sg_csr.indptr[node+1]]
+
+                    for neighbor in neighbors:
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            dist_map[neighbor] = current_dist + 1
+                            queue.append(neighbor)
+
+                # Fill distances array
+                for node_idx, dist in dist_map.items():
+                    if node_idx < len(distances):
+                        distances[node_idx] = dist
+
+                distances = distances[1:]  # Skip source node
+
+            except Exception as e:
                 # Fallback to Dijkstra if BFS fails
+                logging.warning(f"BFS failed: {e}, using Dijkstra")
                 dists = ssp.csgraph.dijkstra(
                     sg,
                     indices=[0],

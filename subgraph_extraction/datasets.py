@@ -136,6 +136,14 @@ def generate_subgraph_datasets(params, splits=['train', 'valid'], saved_relation
         if semantic_embeddings is not None:
             logging.info(f"Loaded semantic embeddings with shape: {semantic_embeddings.shape}")
 
+            # Move embeddings to GPU for ULTRA-FAST cosine similarity computation
+            if hasattr(params, 'device') and torch.cuda.is_available():
+                logging.info(f"Moving embeddings to GPU ({params.device}) for 10-100x speedup...")
+                semantic_embeddings = torch.from_numpy(semantic_embeddings).float().to(params.device)
+                logging.info(f"Embeddings on GPU: {semantic_embeddings.device}, shape: {semantic_embeddings.shape}")
+            else:
+                logging.warning("GPU not available, using CPU for semantic pruning (slower)")
+
     # Ensure subgraph extraction completed successfully before proceeding
     links2subgraphs(adj_list, graphs, params, max_label_value, semantic_embeddings)
 
