@@ -19,15 +19,25 @@ class Evaluator():
         pos_labels = []
         neg_scores = []
         neg_labels = []
-        dataloader = DataLoader(self.data, batch_size=self.params.batch_size, shuffle=False, num_workers=0, collate_fn=self.params.collate_fn)
+        # Use num_workers from params for faster data loading (default: 0 for compatibility)
+        # IMPORTANT: Evaluation often fails with num_workers > 0 due to multiprocessing + LMDB issues
+        # SOLUTION: Force single-threaded evaluation to avoid "received 0 items of ancdata" error
+        num_workers = getattr(self.params, 'num_workers', 0)
+        # Force eval_workers = 0 to avoid multiprocessing errors
+        # Training can still use num_workers > 0, but eval must be single-threaded with LMDB
+        eval_workers = 0  # FORCE 0 to prevent RuntimeError with multiprocessing + LMDB
+
+        dataloader = DataLoader(self.data, batch_size=self.params.batch_size, shuffle=False,
+                               num_workers=eval_workers, collate_fn=self.params.collate_fn)
 
         self.graph_classifier.eval()
         with torch.no_grad():
-            for b_idx, batch in enumerate(dataloader):
+            # Add progress bar for evaluation
+            pbar = tqdm(dataloader, desc="Evaluating", total=len(dataloader))
+            for b_idx, batch in enumerate(pbar):
 
                 data_pos, targets_pos, data_neg, targets_neg = self.params.move_batch_to_device(batch, self.params.device)
-                # print([self.data.id2relation[r.item()] for r in data_pos[1]])
-                # pdb.set_trace()
+
                 score_pos = self.graph_classifier(data_pos)
                 score_neg = self.graph_classifier(data_neg)
 
@@ -36,6 +46,11 @@ class Evaluator():
                 neg_scores += score_neg.squeeze(1).detach().cpu().tolist()
                 pos_labels += targets_pos.tolist()
                 neg_labels += targets_neg.tolist()
+
+                # Update progress bar
+                pbar.set_postfix({'batch': f'{b_idx+1}/{len(dataloader)}'})
+
+            pbar.close()
 
         # acc = metrics.accuracy_score(labels, preds)
         auc = metrics.roc_auc_score(pos_labels + neg_labels, pos_scores + neg_scores)

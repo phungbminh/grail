@@ -12,6 +12,7 @@ class RGCNLayer(nn.Module):
         super(RGCNLayer, self).__init__()
         self.bias = bias
         self.activation = activation
+        self.is_input_layer = is_input_layer  # FIX: Store is_input_layer flag
 
         if self.bias:
             self.bias = nn.Parameter(torch.Tensor(out_dim))
