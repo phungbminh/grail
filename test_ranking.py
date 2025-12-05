@@ -15,6 +15,8 @@ import dgl
 from subgraph_extraction.graph_sampler import (
     subgraph_extraction_labeling,
     intialize_worker as graph_sampler_init_worker,
+    sample_neg,
+    sample_fair_neg,
 )
 from utils.graph_utils import incidence_matrix, ssp_multigraph_to_dgl
 from utils.data_utils import process_files as data_utils_process_files
@@ -91,77 +93,83 @@ def intialize_worker(model, adj_list, dgl_adj_list, id2entity, params, node_feat
     semantic_embeddings_ = semantic_embeddings
 
 
-def get_neg_samples_replacing_head_tail(test_links, adj_list, num_samples=50):
+def get_neg_samples_replacing_head_tail(test_links, adj_list, data_dir, num_samples=50, use_fair_sampling=True):
     """
-    ULTRA-FAST: Pure numpy vectorized negative sampling - NO multiprocessing overhead.
+    Negative sampling for ranking evaluation.
+    Uses sample_fair_neg from pipeline for consistent sampling with training.
+
+    Args:
+        test_links: Test triplets (N, 3)
+        adj_list: Adjacency list
+        data_dir: Data directory (for entity type info in fair sampling)
+        num_samples: Number of negative samples per link
+        use_fair_sampling: If True, use fair (type-constrained) sampling like training
+
+    Returns:
+        neg_triplets: List of dicts with 'head' and 'tail' negative samples
     """
-    n = adj_list[0].shape[0]
     num_links = len(test_links)
-    heads, tails, rels = test_links[:, 0], test_links[:, 1], test_links[:, 2]
+    logging.info(f"  Sampling negatives for {num_links:,} test links (samples={num_samples}, fair={use_fair_sampling})...")
 
-    logging.info(f"  Sampling negatives for {num_links:,} test links (n={n:,}, samples={num_samples})...")
+    if use_fair_sampling:
+        # Use sample_fair_neg from pipeline (same as training)
+        pos_edges, neg_edges = sample_fair_neg(
+            adj_list, test_links, data_dir,
+            num_neg_samples_per_link=num_samples,
+            max_size=len(test_links),  # Use all test links
+            constrained_neg_prob=0.0
+        )
+    else:
+        # Use sample_neg (uniform sampling)
+        pos_edges, neg_edges = sample_neg(
+            adj_list, test_links,
+            num_neg_samples_per_link=num_samples,
+            max_size=len(test_links),
+            constrained_neg_prob=0.0
+        )
 
-    # Pre-compute sparse adjacency matrices as sets for fast lookup
-    logging.info(f"  Building adjacency index...")
-    adj_head_to_tails = [{} for _ in range(len(adj_list))]
-    adj_tail_to_heads = [{} for _ in range(len(adj_list))]
-
-    for rel_idx, adj in enumerate(adj_list):
-        coo = adj.tocoo()
-        for h, t in zip(coo.row, coo.col):
-            if h not in adj_head_to_tails[rel_idx]:
-                adj_head_to_tails[rel_idx][h] = set()
-            adj_head_to_tails[rel_idx][h].add(t)
-            if t not in adj_tail_to_heads[rel_idx]:
-                adj_tail_to_heads[rel_idx][t] = set()
-            adj_tail_to_heads[rel_idx][t].add(h)
-
-    # Vectorized sampling
-    logging.info(f"  Vectorized sampling...")
+    # Convert to ranking format: group by positive link
+    logging.info(f"  Converting to ranking format...")
     neg_triplets = []
-    all_entities = np.arange(n, dtype=np.int64)
 
-    for i in tqdm(range(num_links), desc="Sampling negatives"):
-        head, tail, rel = heads[i], tails[i], rels[i]
+    # Build index: for each positive link, find its negatives
+    # neg_edges format: [neg_head, neg_tail, rel] where one of head/tail is corrupted
+    pos_to_negs_head = {}  # pos_idx -> list of head-corrupted negs
+    pos_to_negs_tail = {}  # pos_idx -> list of tail-corrupted negs
 
-        # Head replacement (sample negative tails)
-        exclude_tails = adj_head_to_tails[rel].get(head, set()) | {head}
-        valid_mask = np.ones(n, dtype=bool)
-        if exclude_tails:
-            valid_mask[list(exclude_tails)] = False
-        valid_tails = all_entities[valid_mask]
+    for i, (pos, neg) in enumerate(zip(pos_edges, neg_edges)):
+        pos_key = (pos[0], pos[1], pos[2])
+        if pos_key not in pos_to_negs_head:
+            pos_to_negs_head[pos_key] = []
+            pos_to_negs_tail[pos_key] = []
 
-        if len(valid_tails) >= num_samples - 1:
-            sampled_tails = np.random.choice(valid_tails, num_samples - 1, replace=False)
+        # Determine if head or tail was corrupted
+        if neg[0] != pos[0]:  # Head corrupted
+            pos_to_negs_head[pos_key].append(neg)
+        elif neg[1] != pos[1]:  # Tail corrupted
+            pos_to_negs_tail[pos_key].append(neg)
+
+    # Build final format for each test link
+    for i in range(num_links):
+        head, tail, rel = test_links[i]
+        pos_key = (head, tail, rel)
+
+        # Head negatives: positive + sampled negatives (for tail prediction)
+        head_negs_list = pos_to_negs_head.get(pos_key, [])
+        if len(head_negs_list) > 0:
+            head_negs = np.array([[head, tail, rel]] + head_negs_list, dtype=np.int64)
         else:
-            sampled_tails = valid_tails
+            head_negs = np.array([[head, tail, rel]], dtype=np.int64)
 
-        head_negs = np.column_stack([
-            np.full(len(sampled_tails) + 1, head, dtype=np.int64),
-            np.concatenate([[tail], sampled_tails]),
-            np.full(len(sampled_tails) + 1, rel, dtype=np.int64)
-        ])
-
-        # Tail replacement (sample negative heads)
-        exclude_heads = adj_tail_to_heads[rel].get(tail, set()) | {tail}
-        valid_mask = np.ones(n, dtype=bool)
-        if exclude_heads:
-            valid_mask[list(exclude_heads)] = False
-        valid_heads = all_entities[valid_mask]
-
-        if len(valid_heads) >= num_samples - 1:
-            sampled_heads = np.random.choice(valid_heads, num_samples - 1, replace=False)
+        # Tail negatives: positive + sampled negatives (for head prediction)
+        tail_negs_list = pos_to_negs_tail.get(pos_key, [])
+        if len(tail_negs_list) > 0:
+            tail_negs = np.array([[head, tail, rel]] + tail_negs_list, dtype=np.int64)
         else:
-            sampled_heads = valid_heads
-
-        tail_negs = np.column_stack([
-            np.concatenate([[head], sampled_heads]),
-            np.full(len(sampled_heads) + 1, tail, dtype=np.int64),
-            np.full(len(sampled_heads) + 1, rel, dtype=np.int64)
-        ])
+            tail_negs = np.array([[head, tail, rel]], dtype=np.int64)
 
         neg_triplets.append({
-            'head': [head_negs, 0],
+            'head': [head_negs, 0],  # 0 = index of positive in array
             'tail': [tail_negs, 0]
         })
 
@@ -360,15 +368,16 @@ def get_rank(neg_links):
     return head_scores, head_rank, tail_scores, tail_rank
 
 
-def get_rank_gpu(neg_links, model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id, A_incidence, device):
-    """Compute rank for a single test link (GPU version for single-thread)"""
+def get_rank_gpu(neg_links, model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id, A_incidence, device, batch_size=16):
+    """Compute rank for a single test link (GPU version with batch processing)"""
     head_neg_links = neg_links['head'][0]
     head_target_id = neg_links['head'][1]
 
     if head_target_id != 10000:
-        data = get_subgraphs_gpu(head_neg_links, adj_list, dgl_adj_list, model.gnn.max_label_value, id2entity, params, node_features, kge_entity2id, A_incidence, device)
-        with torch.no_grad():
-            head_scores = model(data).squeeze(1).cpu().numpy()
+        head_scores = score_links_batched(
+            head_neg_links, model, adj_list, dgl_adj_list, id2entity, params,
+            node_features, kge_entity2id, A_incidence, device, batch_size
+        )
         head_rank = np.argwhere(np.argsort(head_scores)[::-1] == head_target_id) + 1
     else:
         head_scores = np.array([])
@@ -378,15 +387,37 @@ def get_rank_gpu(neg_links, model, adj_list, dgl_adj_list, id2entity, params, no
     tail_target_id = neg_links['tail'][1]
 
     if tail_target_id != 10000:
-        data = get_subgraphs_gpu(tail_neg_links, adj_list, dgl_adj_list, model.gnn.max_label_value, id2entity, params, node_features, kge_entity2id, A_incidence, device)
-        with torch.no_grad():
-            tail_scores = model(data).squeeze(1).cpu().numpy()
+        tail_scores = score_links_batched(
+            tail_neg_links, model, adj_list, dgl_adj_list, id2entity, params,
+            node_features, kge_entity2id, A_incidence, device, batch_size
+        )
         tail_rank = np.argwhere(np.argsort(tail_scores)[::-1] == tail_target_id) + 1
     else:
         tail_scores = np.array([])
         tail_rank = 10000
 
     return head_scores, head_rank, tail_scores, tail_rank
+
+
+def score_links_batched(all_links, model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id, A_incidence, device, batch_size=16):
+    """Score links in batches for better GPU utilization"""
+    all_scores = []
+    num_links = len(all_links)
+
+    for start_idx in range(0, num_links, batch_size):
+        end_idx = min(start_idx + batch_size, num_links)
+        batch_links = all_links[start_idx:end_idx]
+
+        data = get_subgraphs_gpu(
+            batch_links, adj_list, dgl_adj_list, model.gnn.max_label_value,
+            id2entity, params, node_features, kge_entity2id, A_incidence, device
+        )
+
+        with torch.no_grad():
+            batch_scores = model(data).squeeze(1).cpu().numpy()
+        all_scores.extend(batch_scores.tolist())
+
+    return np.array(all_scores)
 
 
 def get_subgraphs_gpu(all_links, adj_list, dgl_adj_list, max_node_label_value, id2entity, params, node_features=None, kge_entity2id=None, A_incidence=None, device=None):
@@ -555,7 +586,12 @@ def main(params):
     num_neg_triplets = 0
 
     if params.mode == 'sample':
-        neg_triplets = get_neg_samples_replacing_head_tail(triplets['links'], adj_list, num_samples=params.num_neg_samples)
+        data_dir = os.path.join('./data', params.dataset)
+        neg_triplets = get_neg_samples_replacing_head_tail(
+            triplets['links'], adj_list, data_dir,
+            num_samples=params.num_neg_samples,
+            use_fair_sampling=params.fair_sampling
+        )
         num_neg_triplets = len(neg_triplets)
         save_to_file(neg_triplets, id2entity, id2relation)
     elif params.mode == 'all':
@@ -582,7 +618,7 @@ def main(params):
     # Use GPU single-thread mode if CUDA is available (faster for inference)
     # Use CPU multiprocessing mode otherwise
     if params.device.type == 'cuda':
-        logger.info(f"Using GPU mode (single-thread) on {params.device}")
+        logger.info(f"Using GPU mode on {params.device} (batch_size={params.batch_size})")
         if params.mode == 'all':
             logger.info(f"  WARNING: mode='all' means ~{len(entity2id):,} negatives per link. This will be SLOW.")
             logger.info(f"  First link processing... (may take several minutes)")
@@ -590,7 +626,8 @@ def main(params):
         for i, neg_link in enumerate(tqdm(data_source, total=num_neg_triplets, desc="Computing ranks (GPU)")):
             head_scores, head_rank, tail_scores, tail_rank = get_rank_gpu(
                 neg_link, model, adj_list, dgl_adj_list, id2entity, params,
-                node_features, kge_entity2id, A_incidence_precomputed, params.device
+                node_features, kge_entity2id, A_incidence_precomputed, params.device,
+                batch_size=params.batch_size
             )
             ranks.append(head_rank)
             ranks.append(tail_rank)
@@ -659,6 +696,10 @@ if __name__ == '__main__':
                         help="Negative sampling mode")
     parser.add_argument("--num_neg_samples", "-ns", type=int, default=50,
                         help="Number of negative samples per link (only for mode=sample)")
+    parser.add_argument("--fair_sampling", "-fs", action='store_true',
+                        help="Use fair (type-constrained) negative sampling like training")
+    parser.add_argument("--batch_size", "-bs", type=int, default=16,
+                        help="Batch size for model inference")
     parser.add_argument("--use_kge_embeddings", "-kge", type=bool, default=False,
                         help='whether to use pretrained KGE embeddings')
     parser.add_argument("--kge_model", type=str, default="TransE",
