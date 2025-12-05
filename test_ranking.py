@@ -273,12 +273,14 @@ def get_subgraphs(all_links, adj_list, dgl_adj_list, max_node_label_value, id2en
 
 
 def get_rank(neg_links):
+    """Compute rank for a single test link (CPU version for multiprocessing)"""
     head_neg_links = neg_links['head'][0]
     head_target_id = neg_links['head'][1]
 
     if head_target_id != 10000:
         data = get_subgraphs(head_neg_links, adj_list_, dgl_adj_list_, model_.gnn.max_label_value, id2entity_, node_features_, kge_entity2id_)
-        head_scores = model_(data).squeeze(1).detach().numpy()
+        with torch.no_grad():
+            head_scores = model_(data).squeeze(1).detach().numpy()
         head_rank = np.argwhere(np.argsort(head_scores)[::-1] == head_target_id) + 1
     else:
         head_scores = np.array([])
@@ -289,13 +291,90 @@ def get_rank(neg_links):
 
     if tail_target_id != 10000:
         data = get_subgraphs(tail_neg_links, adj_list_, dgl_adj_list_, model_.gnn.max_label_value, id2entity_, node_features_, kge_entity2id_)
-        tail_scores = model_(data).squeeze(1).detach().numpy()
+        with torch.no_grad():
+            tail_scores = model_(data).squeeze(1).detach().numpy()
         tail_rank = np.argwhere(np.argsort(tail_scores)[::-1] == tail_target_id) + 1
     else:
         tail_scores = np.array([])
         tail_rank = 10000
 
     return head_scores, head_rank, tail_scores, tail_rank
+
+
+def get_rank_gpu(neg_links, model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id, A_incidence, device):
+    """Compute rank for a single test link (GPU version for single-thread)"""
+    head_neg_links = neg_links['head'][0]
+    head_target_id = neg_links['head'][1]
+
+    if head_target_id != 10000:
+        data = get_subgraphs_gpu(head_neg_links, adj_list, dgl_adj_list, model.gnn.max_label_value, id2entity, params, node_features, kge_entity2id, A_incidence, device)
+        with torch.no_grad():
+            head_scores = model(data).squeeze(1).cpu().numpy()
+        head_rank = np.argwhere(np.argsort(head_scores)[::-1] == head_target_id) + 1
+    else:
+        head_scores = np.array([])
+        head_rank = 10000
+
+    tail_neg_links = neg_links['tail'][0]
+    tail_target_id = neg_links['tail'][1]
+
+    if tail_target_id != 10000:
+        data = get_subgraphs_gpu(tail_neg_links, adj_list, dgl_adj_list, model.gnn.max_label_value, id2entity, params, node_features, kge_entity2id, A_incidence, device)
+        with torch.no_grad():
+            tail_scores = model(data).squeeze(1).cpu().numpy()
+        tail_rank = np.argwhere(np.argsort(tail_scores)[::-1] == tail_target_id) + 1
+    else:
+        tail_scores = np.array([])
+        tail_rank = 10000
+
+    return head_scores, head_rank, tail_scores, tail_rank
+
+
+def get_subgraphs_gpu(all_links, adj_list, dgl_adj_list, max_node_label_value, id2entity, params, node_features=None, kge_entity2id=None, A_incidence=None, device=None):
+    """GPU version of get_subgraphs"""
+    subgraphs = []
+    r_labels = []
+
+    for link in all_links:
+        head, tail, rel = link[0], link[1], link[2]
+        # Use subgraph_extraction_labeling from graph_sampler (returns 5 values)
+        nodes, node_labels, _, _, _ = subgraph_extraction_labeling(
+            (head, tail), rel, adj_list,
+            h=params.hop,
+            enclosing_sub_graph=params.enclosing_sub_graph,
+            max_nodes_per_hop=getattr(params, 'max_nodes_per_hop', None),
+            max_node_label_value=max_node_label_value,
+            A_incidence=A_incidence
+        )
+
+        subgraph = dgl.DGLGraph(dgl_adj_list.subgraph(nodes))
+        subgraph.edata['type'] = dgl_adj_list.edata['type'][dgl_adj_list.subgraph(nodes).parent_eid]
+        subgraph.edata['label'] = torch.tensor(rel * np.ones(subgraph.edata['type'].shape), dtype=torch.long)
+
+        edges_btw_roots = subgraph.edge_id(0, 1)
+        rel_link = np.nonzero(subgraph.edata['type'][edges_btw_roots] == rel)
+
+        if rel_link.squeeze().nelement() == 0:
+            subgraph.add_edge(0, 1)
+            subgraph.edata['type'][-1] = torch.tensor(rel).type(torch.LongTensor)
+            subgraph.edata['label'][-1] = torch.tensor(rel).type(torch.LongTensor)
+
+        kge_nodes = [kge_entity2id[id2entity[n]] for n in nodes] if kge_entity2id else None
+        n_feats = node_features[kge_nodes] if node_features is not None else None
+        subgraph = prepare_features(subgraph, node_labels, max_node_label_value, n_feats)
+
+        subgraphs.append(subgraph)
+        r_labels.append(rel)
+
+    batched_graph = dgl.batch(subgraphs)
+    r_labels = torch.LongTensor(r_labels)
+
+    # Move to GPU if available
+    if device is not None and device.type == 'cuda':
+        batched_graph = batched_graph.to(device)
+        r_labels = r_labels.to(device)
+
+    return (batched_graph, r_labels)
 
 
 def save_to_file(neg_triplets, id2entity, id2relation):
@@ -349,22 +428,53 @@ def get_kge_embeddings(dataset, kge_model):
 
 
 def main(params):
-    model = torch.load(params.model_path, map_location='cpu')
+    # Step 1: Load model
+    logger.info("=" * 50)
+    logger.info("[Step 1/6] Loading model...")
+    start_time = time.time()
 
+    # Load model to GPU if available
+    if params.device.type == 'cuda':
+        logger.info(f"Loading model to GPU: {params.device}")
+        model = torch.load(params.model_path, map_location=params.device)
+        model = model.to(params.device)
+    else:
+        logger.info("Loading model to CPU")
+        model = torch.load(params.model_path, map_location='cpu')
+
+    model.eval()
+    logger.info(f"[Step 1/6] Model loaded in {time.time() - start_time:.2f}s")
+
+    # Step 2: Process files
+    logger.info("=" * 50)
+    logger.info("[Step 2/6] Processing input files...")
+    start_time = time.time()
     adj_list, dgl_adj_list, triplets, entity2id, relation2id, id2entity, id2relation = process_files(params.file_paths, model.relation2id, params.add_traspose_rels)
+    logger.info(f"[Step 2/6] Files processed in {time.time() - start_time:.2f}s")
+    logger.info(f"  - Entities: {len(entity2id):,}")
+    logger.info(f"  - Relations: {len(relation2id)}")
+    logger.info(f"  - Test links: {len(triplets['links']):,}")
 
+    # Step 3: Load KGE embeddings (if enabled)
+    logger.info("=" * 50)
+    logger.info("[Step 3/6] Loading KGE embeddings...")
+    start_time = time.time()
     node_features, kge_entity2id = get_kge_embeddings(params.dataset, params.kge_model) if params.use_kge_embeddings else (None, None)
+    if node_features is not None:
+        logger.info(f"[Step 3/6] KGE embeddings loaded in {time.time() - start_time:.2f}s, shape: {node_features.shape}")
+    else:
+        logger.info(f"[Step 3/6] No KGE embeddings (skipped)")
 
-    # OPTIMIZATION: Pre-compute A_incidence ONCE (saves ~1-2s per subgraph extraction)
-    logger.info("Pre-computing A_incidence matrix (one-time cost)...")
-    precompute_start = time.time()
+    # Step 4: Pre-compute A_incidence matrix
+    logger.info("=" * 50)
+    logger.info("[Step 4/6] Pre-computing A_incidence matrix...")
+    start_time = time.time()
     A_incidence_precomputed = incidence_matrix(adj_list)
     A_incidence_precomputed += A_incidence_precomputed.T
     # Convert to CSR for fast BFS
     if not isinstance(A_incidence_precomputed, ssp.csr_matrix):
         A_incidence_precomputed = A_incidence_precomputed.tocsr()
-    precompute_time = time.time() - precompute_start
-    logger.info(f"A_incidence pre-computed in {precompute_time:.2f}s, shape: {A_incidence_precomputed.shape}")
+    logger.info(f"[Step 4/6] A_incidence pre-computed in {time.time() - start_time:.2f}s, shape: {A_incidence_precomputed.shape}")
 
     # Load semantic embeddings if enabled
     semantic_embeddings = None
@@ -374,6 +484,10 @@ def main(params):
             semantic_embeddings = np.load(params.semantic_embeddings_path)
             logger.info(f"Loaded semantic embeddings: {semantic_embeddings.shape}")
 
+    # Step 5: Generate negative samples
+    logger.info("=" * 50)
+    logger.info("[Step 5/6] Generating negative samples...")
+    start_time = time.time()
     if params.mode == 'sample':
         neg_triplets = get_neg_samples_replacing_head_tail(triplets['links'], adj_list)
         save_to_file(neg_triplets, id2entity, id2relation)
@@ -381,31 +495,55 @@ def main(params):
         neg_triplets = get_neg_samples_replacing_head_tail_all(triplets['links'], adj_list)
     elif params.mode == 'ruleN':
         neg_triplets = get_neg_samples_replacing_head_tail_from_ruleN(params.ruleN_pred_path, entity2id, relation2id)
+    logger.info(f"[Step 5/6] Negative samples generated in {time.time() - start_time:.2f}s")
+    logger.info(f"  - Total neg triplets: {len(neg_triplets):,}")
+
+    # Step 6: Compute rankings
+    logger.info("=" * 50)
+    logger.info("[Step 6/6] Computing rankings (this may take a while)...")
+    start_time = time.time()
 
     ranks = []
     all_head_scores = []
     all_tail_scores = []
 
-    # OPTIMIZATION: Pass pre-computed A_incidence to workers
-    init_args = (model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id, A_incidence_precomputed, semantic_embeddings)
-
-    with mp.Pool(processes=None, initializer=intialize_worker, initargs=init_args) as p:
-        for head_scores, head_rank, tail_scores, tail_rank in tqdm(p.imap(get_rank, neg_triplets), total=len(neg_triplets)):
+    # Use GPU single-thread mode if CUDA is available (faster for inference)
+    # Use CPU multiprocessing mode otherwise
+    if params.device.type == 'cuda':
+        logger.info(f"Using GPU mode (single-thread) on {params.device}")
+        for i, neg_link in enumerate(tqdm(neg_triplets, desc="Computing ranks (GPU)")):
+            head_scores, head_rank, tail_scores, tail_rank = get_rank_gpu(
+                neg_link, model, adj_list, dgl_adj_list, id2entity, params,
+                node_features, kge_entity2id, A_incidence_precomputed, params.device
+            )
             ranks.append(head_rank)
             ranks.append(tail_rank)
-
             all_head_scores += head_scores.tolist()
             all_tail_scores += tail_scores.tolist()
 
-    # intialize_worker(model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id)
-    # for link in tqdm(neg_triplets, total=len(neg_triplets)):
-    #     head_scores, head_rank, tail_scores, tail_rank = get_rank(link)
-    #     ranks.append(head_rank)
-    #     ranks.append(tail_rank)
+            # Log progress every 100 links
+            if (i + 1) % 100 == 0:
+                elapsed = time.time() - start_time
+                eta = elapsed / (i + 1) * (len(neg_triplets) - i - 1)
+                logger.info(f"  Progress: {i+1}/{len(neg_triplets)} | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s")
+    else:
+        logger.info("Using CPU mode (multiprocessing)")
+        # Pass pre-computed A_incidence to workers
+        init_args = (model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id, A_incidence_precomputed, semantic_embeddings)
 
-    #     all_head_scores += head_scores.tolist()
-    #     all_tail_scores += tail_scores.tolist()
+        with mp.Pool(processes=None, initializer=intialize_worker, initargs=init_args) as p:
+            for head_scores, head_rank, tail_scores, tail_rank in tqdm(p.imap(get_rank, neg_triplets), total=len(neg_triplets), desc="Computing ranks (CPU)"):
+                ranks.append(head_rank)
+                ranks.append(tail_rank)
 
+                all_head_scores += head_scores.tolist()
+                all_tail_scores += tail_scores.tolist()
+
+    logger.info(f"[Step 6/6] Rankings computed in {time.time() - start_time:.2f}s")
+
+    # Save results
+    logger.info("=" * 50)
+    logger.info("Saving results...")
     if params.mode == 'ruleN':
         save_score_to_file_from_ruleN(neg_triplets, all_head_scores, all_tail_scores, id2entity, id2relation)
     else:
@@ -449,6 +587,12 @@ if __name__ == '__main__':
     parser.add_argument('--add_traspose_rels', '-tr', type=bool, default=False,
                         help='Whether to append adj matrix list with symmetric relations?')
 
+    # GPU params
+    parser.add_argument("--gpu", type=int, default=0,
+                        help="Which GPU to use?")
+    parser.add_argument('--disable_cuda', action='store_true',
+                        help='Disable CUDA')
+
     # Graph pooling params
     parser.add_argument('--pool_type', '-pool', type=str, default='mean',
                         choices=['mean', 'sum', 'max', 'attention', 'query_attention'],
@@ -482,11 +626,18 @@ if __name__ == '__main__':
     params.ruleN_pred_path = os.path.join('./data', params.dataset, 'pos_predictions.txt')
     params.model_path = os.path.join('experiments', params.experiment_name, 'best_graph_classifier.pth')
 
+    # Set device (GPU or CPU)
+    if not params.disable_cuda and torch.cuda.is_available():
+        params.device = torch.device('cuda:%d' % params.gpu)
+    else:
+        params.device = torch.device('cpu')
+
     file_handler = logging.FileHandler(os.path.join('experiments', params.experiment_name, f'log_rank_test_{time.time()}.txt'))
     logger = logging.getLogger()
     logger.addHandler(file_handler)
 
     logger.info('============ Initialized logger ============')
+    logger.info(f'Device: {params.device}')
     logger.info('\n'.join('%s: %s' % (k, str(v)) for k, v
                           in sorted(dict(vars(params)).items())))
     logger.info('============================================')
