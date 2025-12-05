@@ -555,7 +555,7 @@ def main(params):
     num_neg_triplets = 0
 
     if params.mode == 'sample':
-        neg_triplets = get_neg_samples_replacing_head_tail(triplets['links'], adj_list)
+        neg_triplets = get_neg_samples_replacing_head_tail(triplets['links'], adj_list, num_samples=params.num_neg_samples)
         num_neg_triplets = len(neg_triplets)
         save_to_file(neg_triplets, id2entity, id2relation)
     elif params.mode == 'all':
@@ -583,6 +583,10 @@ def main(params):
     # Use CPU multiprocessing mode otherwise
     if params.device.type == 'cuda':
         logger.info(f"Using GPU mode (single-thread) on {params.device}")
+        if params.mode == 'all':
+            logger.info(f"  WARNING: mode='all' means ~{len(entity2id):,} negatives per link. This will be SLOW.")
+            logger.info(f"  First link processing... (may take several minutes)")
+
         for i, neg_link in enumerate(tqdm(data_source, total=num_neg_triplets, desc="Computing ranks (GPU)")):
             head_scores, head_rank, tail_scores, tail_rank = get_rank_gpu(
                 neg_link, model, adj_list, dgl_adj_list, id2entity, params,
@@ -593,6 +597,9 @@ def main(params):
             all_head_scores += head_scores.tolist()
             all_tail_scores += tail_scores.tolist()
 
+            # Log first few links to confirm progress
+            if i < 3:
+                logger.info(f"  Link {i+1} done: head_rank={head_rank}, tail_rank={tail_rank}, head_negs={len(neg_link['head'][0])}, tail_negs={len(neg_link['tail'][0])}")
 
             # Log progress every 100 links
             if (i + 1) % 100 == 0:
@@ -650,6 +657,8 @@ if __name__ == '__main__':
                         help="Path to dataset")
     parser.add_argument("--mode", "-m", type=str, default="sample", choices=["sample", "all", "ruleN"],
                         help="Negative sampling mode")
+    parser.add_argument("--num_neg_samples", "-ns", type=int, default=50,
+                        help="Number of negative samples per link (only for mode=sample)")
     parser.add_argument("--use_kge_embeddings", "-kge", type=bool, default=False,
                         help='whether to use pretrained KGE embeddings')
     parser.add_argument("--kge_model", type=str, default="TransE",
