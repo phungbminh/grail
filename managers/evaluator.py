@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+import torch.nn as nn
 import pdb
 from sklearn import metrics
 import torch.nn.functional as F
@@ -13,12 +14,15 @@ class Evaluator():
         self.params = params
         self.graph_classifier = graph_classifier
         self.data = data
+        self.criterion = nn.MarginRankingLoss(self.params.margin, reduction='mean')
 
     def eval(self, save=False):
         pos_scores = []
         pos_labels = []
         neg_scores = []
         neg_labels = []
+        total_loss = 0
+        num_batches = 0
         # Use num_workers from params for faster data loading (default: 0 for compatibility)
         # IMPORTANT: Evaluation often fails with num_workers > 0 due to multiprocessing + LMDB issues
         # SOLUTION: Force single-threaded evaluation to avoid "received 0 items of ancdata" error
@@ -41,6 +45,15 @@ class Evaluator():
                 score_pos = self.graph_classifier(data_pos)
                 score_neg = self.graph_classifier(data_neg)
 
+                # Compute validation loss
+                loss = self.criterion(
+                    score_pos.squeeze(1),
+                    score_neg.view(len(score_pos), -1).mean(dim=1),
+                    torch.ones(len(score_pos)).to(device=self.params.device)
+                )
+                total_loss += loss.item()
+                num_batches += 1
+
                 # preds += torch.argmax(logits.detach().cpu(), dim=1).tolist()
                 pos_scores += score_pos.squeeze(1).detach().cpu().tolist()
                 neg_scores += score_neg.squeeze(1).detach().cpu().tolist()
@@ -48,7 +61,7 @@ class Evaluator():
                 neg_labels += targets_neg.tolist()
 
                 # Update progress bar
-                pbar.set_postfix({'batch': f'{b_idx+1}/{len(dataloader)}'})
+                pbar.set_postfix({'batch': f'{b_idx+1}/{len(dataloader)}', 'loss': f'{loss.item():.4f}'})
 
             pbar.close()
 
@@ -73,4 +86,5 @@ class Evaluator():
                 for ([s, r, o], score) in zip(neg_triplets, neg_scores):
                     f.write('\t'.join([s, r, o, str(score)]) + '\n')
 
-        return {'auc': auc, 'auc_pr': auc_pr}
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0
+        return {'auc': auc, 'auc_pr': auc_pr, 'loss': avg_loss}

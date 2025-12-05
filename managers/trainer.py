@@ -86,6 +86,7 @@ class Trainer():
                 torch.ones(len(score_pos)).to(device=self.params.device)
             )
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model_params, self.params.clip)
             self.optimizer.step()
 
             self.updates_counter += 1
@@ -93,7 +94,7 @@ class Trainer():
             with torch.no_grad():
                 all_scores += score_pos.squeeze().detach().cpu().tolist() + score_neg.squeeze().detach().cpu().tolist()
                 all_labels += targets_pos.tolist() + targets_neg.tolist()
-                total_loss += loss
+                total_loss += loss.item()
 
             # Update progress bar with current loss
             pbar.set_postfix({'loss': f'{loss.item():.4f}', 'batch': b_idx})
@@ -115,6 +116,8 @@ class Trainer():
                 self.writer.add_scalar('AUC/validation', result['auc'], self.updates_counter)
                 if 'auc_pr' in result:
                     self.writer.add_scalar('AUC_PR/validation', result['auc_pr'], self.updates_counter)
+                if 'loss' in result:
+                    self.writer.add_scalar('Loss/validation', result['loss'], self.updates_counter)
                 if 'hits@10' in result:
                     self.writer.add_scalar('Hits@10/validation', result['hits@10'], self.updates_counter)
                 if 'mrr' in result:

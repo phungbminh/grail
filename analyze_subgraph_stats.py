@@ -41,7 +41,7 @@ def analyze_subgraph_stats(db_path, splits=['train', 'valid'], sample_limit=None
         split_stats = {
             'pos': {'node_counts': [], 'missing': 0, 'valid': 0},
             'neg': {'node_counts': [], 'missing': 0, 'valid': 0}
-        }/
+        }
 
         # Analyze positive and negative samples
         for sample_type in ['pos', 'neg']:

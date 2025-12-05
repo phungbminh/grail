@@ -20,16 +20,20 @@ def main(params):
     simplefilter(action='ignore', category=UserWarning)
     simplefilter(action='ignore', category=SparseEfficiencyWarning)
 
-    # Include max_nodes_per_hop and semantic pruning in cache path to avoid using wrong cache
-    max_nodes_str = f"_maxnodes_{params.max_nodes_per_hop}" if params.max_nodes_per_hop else ""
-    semantic_str = ""
-    if hasattr(params, 'use_semantic_pruning') and params.use_semantic_pruning:
-        semantic_str = f"_semantic_pruning_sr{params.stage1_ratio}_pw{params.path_weight}_sw{params.semantic_weight}_tss{params.target_subgraph_size}"
+    # Allow user to specify custom db_path or auto-generate
+    if params.db_path is None:
+        # Include max_nodes_per_hop and semantic pruning in cache path to avoid using wrong cache
+        max_nodes_str = f"_maxnodes_{params.max_nodes_per_hop}" if params.max_nodes_per_hop else ""
+        semantic_str = ""
+        if hasattr(params, 'use_semantic_pruning') and params.use_semantic_pruning:
+            semantic_str = f"_semantic_pruning_sr{params.stage1_ratio}_pw{params.path_weight}_sw{params.semantic_weight}_tss{params.target_subgraph_size}"
 
-    params.db_path = os.path.join(
-        params.main_dir,
-        f'data/{params.dataset}/subgraphs_en_{params.enclosing_sub_graph}_neg_{params.num_neg_samples_per_link}_hop_{params.hop}{max_nodes_str}{semantic_str}'
-    )
+        params.db_path = os.path.join(
+            params.main_dir,
+            f'data/{params.dataset}/subgraphs_en_{params.enclosing_sub_graph}_neg_{params.num_neg_samples_per_link}_hop_{params.hop}{max_nodes_str}{semantic_str}'
+        )
+    else:
+        logging.info(f"Using custom db_path: {params.db_path}")
 
     # Check if cache exists, if not create new one
     if not os.path.isdir(params.db_path):
@@ -130,7 +134,7 @@ if __name__ == '__main__':
                         help="Early stopping patience")
     parser.add_argument("--optimizer", type=str, default="Adam",
                         help="Which optimizer to use?")
-    parser.add_argument("--lr", type=float, default=0.01,
+    parser.add_argument("--lr", type=float, default=0.001,
                         help="Learning rate of the optimizer")
     parser.add_argument("--clip", type=int, default=1000,
                         help="Maximum gradient norm allowed")
@@ -140,6 +144,8 @@ if __name__ == '__main__':
                         help="The margin between positive and negative samples in the max-margin loss")
 
     # Data processing pipeline params
+    parser.add_argument("--db_path", type=str, default=None,
+                        help="Custom path to subgraph database. If not specified, auto-generate based on parameters")
     parser.add_argument("--max_links", type=int, default=1000000,
                         help="Set maximum number of train links (to fit into memory)")
     parser.add_argument("--hop", type=int, default=3,
@@ -186,6 +192,12 @@ if __name__ == '__main__':
                         help='whether to concatenate head/tail embedding with pooled graph representation')
     parser.add_argument('--has_attn', '-attn', type=bool, default=True,
                         help='whether to have attn in model or not')
+
+    # GNN backbone selection
+    parser.add_argument('--gnn_type', type=str, default='rgcn', choices=['rgcn', 'compgcn'],
+                        help='GNN backbone: rgcn (original GraIL) or compgcn (1.5-2x faster with shared weights)')
+    parser.add_argument('--comp_fn', type=str, default='sub', choices=['sub', 'mult', 'corr'],
+                        help='CompGCN composition function (only used when --gnn_type compgcn): sub (subtraction), mult (multiplication), corr (circular correlation)')
 
     # Graph pooling params
     parser.add_argument('--pool_type', '-pool', type=str, default='mean',
