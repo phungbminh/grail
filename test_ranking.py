@@ -91,135 +91,149 @@ def intialize_worker(model, adj_list, dgl_adj_list, id2entity, params, node_feat
     semantic_embeddings_ = semantic_embeddings
 
 
-def _sample_neg_for_link(args):
-    """Worker function for parallel negative sampling."""
-    head, tail, rel, adj_rel_row, adj_rel_col, n, num_samples = args
-
-    neg_triplet = {'head': [[], 0], 'tail': [[], 0]}
-
-    # Head replacement: keep head fixed, sample negative tails
-    neg_triplet['head'][0].append([head, tail, rel])
-    # Get existing tails for this head in this relation
-    existing_tails = set(adj_rel_col)
-    existing_tails.add(head)  # exclude self-loop
-
-    candidates = np.array([i for i in range(n) if i not in existing_tails])
-    if len(candidates) >= num_samples - 1:
-        sampled = np.random.choice(candidates, num_samples - 1, replace=False)
-    else:
-        sampled = candidates
-
-    for neg_tail in sampled:
-        neg_triplet['head'][0].append([head, neg_tail, rel])
-
-    # Tail replacement: keep tail fixed, sample negative heads
-    neg_triplet['tail'][0].append([head, tail, rel])
-    # Get existing heads for this tail in this relation
-    existing_heads = set(adj_rel_row)
-    existing_heads.add(tail)  # exclude self-loop
-
-    candidates = np.array([i for i in range(n) if i not in existing_heads])
-    if len(candidates) >= num_samples - 1:
-        sampled = np.random.choice(candidates, num_samples - 1, replace=False)
-    else:
-        sampled = candidates
-
-    for neg_head in sampled:
-        neg_triplet['tail'][0].append([neg_head, tail, rel])
-
-    neg_triplet['head'][0] = np.array(neg_triplet['head'][0])
-    neg_triplet['tail'][0] = np.array(neg_triplet['tail'][0])
-
-    return neg_triplet
-
-
 def get_neg_samples_replacing_head_tail(test_links, adj_list, num_samples=50):
     """
-    OPTIMIZED: Vectorized negative sampling with parallel processing.
+    ULTRA-FAST: Pure numpy vectorized negative sampling - NO multiprocessing overhead.
     """
     n = adj_list[0].shape[0]
+    num_links = len(test_links)
     heads, tails, rels = test_links[:, 0], test_links[:, 1], test_links[:, 2]
 
-    logging.info(f"  Preparing negative sampling for {len(heads)} test links...")
+    logging.info(f"  Sampling negatives for {num_links:,} test links (n={n:,}, samples={num_samples})...")
 
-    # Pre-compute adjacency info for each relation
-    adj_coo = {i: adj.tocoo() for i, adj in enumerate(adj_list)}
+    # Pre-compute sparse adjacency matrices as sets for fast lookup
+    logging.info(f"  Building adjacency index...")
+    adj_head_to_tails = [{} for _ in range(len(adj_list))]
+    adj_tail_to_heads = [{} for _ in range(len(adj_list))]
 
-    # Prepare arguments for parallel processing
-    args_list = []
-    for head, tail, rel in zip(heads, tails, rels):
-        coo = adj_coo[rel]
-        # Get row indices where head appears
-        head_mask = coo.row == head
-        adj_rel_col = coo.col[head_mask]
-        # Get col indices where tail appears
-        tail_mask = coo.col == tail
-        adj_rel_row = coo.row[tail_mask]
-        args_list.append((head, tail, rel, adj_rel_row, adj_rel_col, n, num_samples))
+    for rel_idx, adj in enumerate(adj_list):
+        coo = adj.tocoo()
+        for h, t in zip(coo.row, coo.col):
+            if h not in adj_head_to_tails[rel_idx]:
+                adj_head_to_tails[rel_idx][h] = set()
+            adj_head_to_tails[rel_idx][h].add(t)
+            if t not in adj_tail_to_heads[rel_idx]:
+                adj_tail_to_heads[rel_idx][t] = set()
+            adj_tail_to_heads[rel_idx][t].add(h)
 
-    # Parallel processing
-    logging.info(f"  Running parallel negative sampling...")
-    with mp.Pool(processes=mp.cpu_count()) as pool:
-        neg_triplets = list(tqdm(pool.imap(_sample_neg_for_link, args_list),
-                                  total=len(args_list), desc="Sampling negatives"))
+    # Vectorized sampling
+    logging.info(f"  Vectorized sampling...")
+    neg_triplets = []
+    all_entities = np.arange(n, dtype=np.int64)
+
+    for i in tqdm(range(num_links), desc="Sampling negatives"):
+        head, tail, rel = heads[i], tails[i], rels[i]
+
+        # Head replacement (sample negative tails)
+        exclude_tails = adj_head_to_tails[rel].get(head, set()) | {head}
+        valid_mask = np.ones(n, dtype=bool)
+        if exclude_tails:
+            valid_mask[list(exclude_tails)] = False
+        valid_tails = all_entities[valid_mask]
+
+        if len(valid_tails) >= num_samples - 1:
+            sampled_tails = np.random.choice(valid_tails, num_samples - 1, replace=False)
+        else:
+            sampled_tails = valid_tails
+
+        head_negs = np.column_stack([
+            np.full(len(sampled_tails) + 1, head, dtype=np.int64),
+            np.concatenate([[tail], sampled_tails]),
+            np.full(len(sampled_tails) + 1, rel, dtype=np.int64)
+        ])
+
+        # Tail replacement (sample negative heads)
+        exclude_heads = adj_tail_to_heads[rel].get(tail, set()) | {tail}
+        valid_mask = np.ones(n, dtype=bool)
+        if exclude_heads:
+            valid_mask[list(exclude_heads)] = False
+        valid_heads = all_entities[valid_mask]
+
+        if len(valid_heads) >= num_samples - 1:
+            sampled_heads = np.random.choice(valid_heads, num_samples - 1, replace=False)
+        else:
+            sampled_heads = valid_heads
+
+        tail_negs = np.column_stack([
+            np.concatenate([[head], sampled_heads]),
+            np.full(len(sampled_heads) + 1, tail, dtype=np.int64),
+            np.full(len(sampled_heads) + 1, rel, dtype=np.int64)
+        ])
+
+        neg_triplets.append({
+            'head': [head_negs, 0],
+            'tail': [tail_negs, 0]
+        })
 
     return neg_triplets
 
 
-def _sample_neg_all_for_link(args):
-    """Worker function for parallel ALL negative sampling."""
-    head, tail, rel, adj_rel_row_set, adj_rel_col_set, n = args
-
-    neg_triplet = {'head': [[], 0], 'tail': [[], 0]}
-
-    # Head replacement: keep head fixed, get ALL valid negative tails
-    neg_triplet['head'][0].append([head, tail, rel])
-    for neg_tail in range(n):
-        if neg_tail != head and neg_tail not in adj_rel_col_set:
-            neg_triplet['head'][0].append([head, neg_tail, rel])
-
-    # Tail replacement: keep tail fixed, get ALL valid negative heads
-    neg_triplet['tail'][0].append([head, tail, rel])
-    for neg_head in range(n):
-        if neg_head != tail and neg_head not in adj_rel_row_set:
-            neg_triplet['tail'][0].append([neg_head, tail, rel])
-
-    neg_triplet['head'][0] = np.array(neg_triplet['head'][0])
-    neg_triplet['tail'][0] = np.array(neg_triplet['tail'][0])
-
-    return neg_triplet
-
-
 def get_neg_samples_replacing_head_tail_all(test_links, adj_list):
     """
-    OPTIMIZED: Vectorized ALL negative sampling with parallel processing.
+    ULTRA-FAST: Pure numpy vectorized ALL negative sampling - NO multiprocessing overhead.
+    For 162K links, multiprocessing has too much serialization overhead.
+    Single-thread numpy is faster.
     """
     n = adj_list[0].shape[0]
+    num_links = len(test_links)
     heads, tails, rels = test_links[:, 0], test_links[:, 1], test_links[:, 2]
 
-    logging.info(f"  Preparing ALL negative sampling for {len(heads)} test links...")
+    logging.info(f"  Generating ALL negatives for {num_links:,} test links (n={n:,} entities)...")
 
-    # Pre-compute adjacency info for each relation
-    adj_coo = {i: adj.tocoo() for i, adj in enumerate(adj_list)}
+    # Pre-compute sparse adjacency as numpy arrays for vectorized operations
+    logging.info(f"  Building adjacency index for {len(adj_list)} relations...")
+    adj_head_to_tails = [{} for _ in range(len(adj_list))]
+    adj_tail_to_heads = [{} for _ in range(len(adj_list))]
 
-    # Prepare arguments for parallel processing
-    args_list = []
-    for head, tail, rel in zip(heads, tails, rels):
-        coo = adj_coo[rel]
-        # Get existing (head, *) pairs -> set of tails
-        head_mask = coo.row == head
-        adj_rel_col_set = set(coo.col[head_mask])
-        # Get existing (*, tail) pairs -> set of heads
-        tail_mask = coo.col == tail
-        adj_rel_row_set = set(coo.row[tail_mask])
-        args_list.append((head, tail, rel, adj_rel_row_set, adj_rel_col_set, n))
+    for rel_idx, adj in enumerate(adj_list):
+        coo = adj.tocoo()
+        for h, t in zip(coo.row, coo.col):
+            if h not in adj_head_to_tails[rel_idx]:
+                adj_head_to_tails[rel_idx][h] = set()
+            adj_head_to_tails[rel_idx][h].add(t)
+            if t not in adj_tail_to_heads[rel_idx]:
+                adj_tail_to_heads[rel_idx][t] = set()
+            adj_tail_to_heads[rel_idx][t].add(h)
 
-    # Parallel processing
-    logging.info(f"  Running parallel ALL negative sampling with {mp.cpu_count()} workers...")
-    with mp.Pool(processes=mp.cpu_count()) as pool:
-        neg_triplets = list(tqdm(pool.imap(_sample_neg_all_for_link, args_list),
-                                  total=len(args_list), desc="Sampling ALL negatives"))
+    logging.info(f"  Generating negative samples (vectorized)...")
+    neg_triplets = []
+    all_entities = np.arange(n, dtype=np.int64)
 
+    for i in tqdm(range(num_links), desc="Generating ALL negatives"):
+        head, tail, rel = int(heads[i]), int(tails[i]), int(rels[i])
+
+        # Head replacement: get ALL valid negative tails
+        exclude_tails = adj_head_to_tails[rel].get(head, set()) | {head}
+        valid_mask = np.ones(n, dtype=bool)
+        valid_mask[list(exclude_tails)] = False
+        valid_neg_tails = all_entities[valid_mask]
+
+        num_head_negs = len(valid_neg_tails) + 1
+        head_negs = np.empty((num_head_negs, 3), dtype=np.int64)
+        head_negs[:, 0] = head
+        head_negs[0, 1] = tail
+        head_negs[1:, 1] = valid_neg_tails
+        head_negs[:, 2] = rel
+
+        # Tail replacement: get ALL valid negative heads
+        exclude_heads = adj_tail_to_heads[rel].get(tail, set()) | {tail}
+        valid_mask = np.ones(n, dtype=bool)
+        valid_mask[list(exclude_heads)] = False
+        valid_neg_heads = all_entities[valid_mask]
+
+        num_tail_negs = len(valid_neg_heads) + 1
+        tail_negs = np.empty((num_tail_negs, 3), dtype=np.int64)
+        tail_negs[0, 0] = head
+        tail_negs[1:, 0] = valid_neg_heads
+        tail_negs[:, 1] = tail
+        tail_negs[:, 2] = rel
+
+        neg_triplets.append({
+            'head': [head_negs, 0],
+            'tail': [tail_negs, 0]
+        })
+
+    logging.info(f"  Done! Generated {len(neg_triplets):,} negative triplet sets")
     return neg_triplets
 
 
