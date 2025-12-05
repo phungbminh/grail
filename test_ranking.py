@@ -1,5 +1,4 @@
 import os
-import random
 import argparse
 import logging
 import json
@@ -8,36 +7,31 @@ import time
 import multiprocessing as mp
 import scipy.sparse as ssp
 from tqdm import tqdm
-from collections import deque
-import networkx as nx
 import torch
 import numpy as np
 import dgl
 
-# Import from graph_sampler to reuse existing functions
+# Reuse optimized functions from pipeline
 from subgraph_extraction.graph_sampler import (
     subgraph_extraction_labeling,
-    get_neighbor_nodes,
-    node_label
+    intialize_worker as graph_sampler_init_worker,
 )
-from utils.graph_utils import incidence_matrix
+from utils.graph_utils import incidence_matrix, ssp_multigraph_to_dgl
+from utils.data_utils import process_files as data_utils_process_files
 
 
-def process_files(files, saved_relation2id, add_traspose_rels):
-    '''
-    files: Dictionary map of file paths to read the triplets from.
-    saved_relation2id: Saved relation2id (mostly passed from a trained model) which can be used to map relations to pre-defined indices and filter out the unknown ones.
-    '''
+def process_files_ranking(files, saved_relation2id, add_traspose_rels):
+    """
+    Process files for ranking evaluation.
+    Uses 'graph' key instead of 'train' for adj_list construction.
+    """
     entity2id = {}
     relation2id = saved_relation2id
-
     triplets = {}
-
     ent = 0
-    rel = 0
 
     for file_type, file_path in files.items():
-
+        logging.info(f"  Reading {file_type}: {file_path}")
         data = []
         with open(file_path) as f:
             file_data = [line.split() for line in f.read().split('\n')[:-1]]
@@ -49,42 +43,46 @@ def process_files(files, saved_relation2id, add_traspose_rels):
             if triplet[2] not in entity2id:
                 entity2id[triplet[2]] = ent
                 ent += 1
-
-            # Save the triplets corresponding to only the known relations
             if triplet[1] in saved_relation2id:
                 data.append([entity2id[triplet[0]], entity2id[triplet[2]], saved_relation2id[triplet[1]]])
 
         triplets[file_type] = np.array(data)
+        logging.info(f"  {file_type}: {len(data):,} triplets")
 
     id2entity = {v: k for k, v in entity2id.items()}
     id2relation = {v: k for k, v in relation2id.items()}
 
-    # Construct the list of adjacency matrix each corresponding to eeach relation. Note that this is constructed only from the train data.
+    # Build adjacency matrices from 'graph' (train) data
+    logging.info(f"  Building adjacency matrices for {len(saved_relation2id)} relations...")
     adj_list = []
     for i in range(len(saved_relation2id)):
         idx = np.argwhere(triplets['graph'][:, 2] == i)
-        adj_list.append(ssp.csc_matrix((np.ones(len(idx), dtype=np.uint8), (triplets['graph'][:, 0][idx].squeeze(1), triplets['graph'][:, 1][idx].squeeze(1))), shape=(len(entity2id), len(entity2id))))
+        adj_list.append(ssp.csc_matrix(
+            (np.ones(len(idx), dtype=np.uint8),
+             (triplets['graph'][:, 0][idx].squeeze(1), triplets['graph'][:, 1][idx].squeeze(1))),
+            shape=(len(entity2id), len(entity2id))
+        ))
 
-    # Add transpose matrices to handle both directions of relations.
     adj_list_aug = adj_list
     if add_traspose_rels:
         adj_list_t = [adj.T for adj in adj_list]
         adj_list_aug = adj_list + adj_list_t
 
+    logging.info(f"  Converting to DGL graph...")
     dgl_adj_list = ssp_multigraph_to_dgl(adj_list_aug)
 
     return adj_list, dgl_adj_list, triplets, entity2id, relation2id, id2entity, id2relation
 
 
 def intialize_worker(model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id, A_incidence_precomputed=None, semantic_embeddings=None):
+    """Initialize worker for multiprocessing ranking evaluation."""
     global model_, adj_list_, dgl_adj_list_, id2entity_, params_, node_features_, kge_entity2id_, A_incidence_, semantic_embeddings_
     model_, adj_list_, dgl_adj_list_, id2entity_, params_, node_features_, kge_entity2id_ = model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id
 
-    # OPTIMIZATION: Use pre-computed A_incidence (saves ~1-2s per subgraph)
+    # Use pre-computed A_incidence (saves ~1-2s per subgraph)
     if A_incidence_precomputed is not None:
         A_incidence_ = A_incidence_precomputed
     else:
-        # Fallback: compute if not provided
         A_incidence_ = incidence_matrix(adj_list)
         A_incidence_ += A_incidence_.T
         if not isinstance(A_incidence_, ssp.csr_matrix):
@@ -183,30 +181,6 @@ def get_neg_samples_replacing_head_tail_from_ruleN(ruleN_pred_path, entity2id, s
     return neg_triplets
 
 
-
-def ssp_multigraph_to_dgl(graph, n_feats=None):
-    """
-    Converting ssp multigraph (i.e. list of adjs) to dgl multigraph.
-    """
-
-    g_nx = nx.MultiDiGraph()
-    g_nx.add_nodes_from(list(range(graph[0].shape[0])))
-    # Add edges
-    for rel, adj in enumerate(graph):
-        # Convert adjacency matrix to tuples for nx0
-        nx_triplets = []
-        for src, dst in list(zip(adj.tocoo().row, adj.tocoo().col)):
-            nx_triplets.append((src, dst, {'type': rel}))
-        g_nx.add_edges_from(nx_triplets)
-
-    # make dgl graph
-    g_dgl = dgl.DGLGraph(multigraph=True)
-    g_dgl.from_networkx(g_nx, edge_attrs=['type'])
-    # add node features
-    if n_feats is not None:
-        g_dgl.ndata['feat'] = torch.tensor(n_feats)
-
-    return g_dgl
 
 
 def prepare_features(subgraph, n_labels, max_n_label, n_feats=None):
@@ -449,7 +423,7 @@ def main(params):
     logger.info("=" * 50)
     logger.info("[Step 2/6] Processing input files...")
     start_time = time.time()
-    adj_list, dgl_adj_list, triplets, entity2id, relation2id, id2entity, id2relation = process_files(params.file_paths, model.relation2id, params.add_traspose_rels)
+    adj_list, dgl_adj_list, triplets, entity2id, relation2id, id2entity, id2relation = process_files_ranking(params.file_paths, model.relation2id, params.add_traspose_rels)
     logger.info(f"[Step 2/6] Files processed in {time.time() - start_time:.2f}s")
     logger.info(f"  - Entities: {len(entity2id):,}")
     logger.info(f"  - Relations: {len(relation2id)}")

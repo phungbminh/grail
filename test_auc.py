@@ -1,8 +1,7 @@
-# from comet_ml import Experiment
-import pdb
 import os
 import argparse
 import logging
+import time
 import torch
 from scipy.sparse import SparseEfficiencyWarning
 import numpy as np
@@ -19,18 +18,24 @@ def main(params):
     simplefilter(action='ignore', category=UserWarning)
     simplefilter(action='ignore', category=SparseEfficiencyWarning)
 
+    # Step 1: Load model
+    logging.info("=" * 50)
+    logging.info("[Step 1/4] Loading model...")
+    start_time = time.time()
     graph_classifier = initialize_model(params, None, load_model=True)
-
-    logging.info(f"Device: {params.device}")
+    logging.info(f"[Step 1/4] Model loaded in {time.time() - start_time:.2f}s")
+    logging.info(f"  Device: {params.device}")
 
     all_auc = []
     auc_mean = 0
-
     all_auc_pr = []
     auc_pr_mean = 0
-    for r in range(1, params.runs + 1):
 
-        # Include max_nodes_per_hop and semantic pruning in cache path to avoid using wrong cache
+    for r in range(1, params.runs + 1):
+        logging.info("=" * 50)
+        logging.info(f"[Run {r}/{params.runs}]")
+
+        # Step 2: Build cache path
         max_nodes_str = f"_maxnodes_{params.max_nodes_per_hop}" if params.max_nodes_per_hop else ""
         semantic_str = ""
         if hasattr(params, 'use_semantic_pruning') and params.use_semantic_pruning:
@@ -38,31 +43,44 @@ def main(params):
 
         params.db_path = os.path.join(params.main_dir, f'data/{params.dataset}/test_subgraphs_{params.experiment_name}_{params.constrained_neg_prob}_en_{params.enclosing_sub_graph}_neg_{params.num_neg_samples_per_link}_hop_{params.hop}{max_nodes_str}{semantic_str}')
 
+        # Step 2: Generate subgraph datasets
+        logging.info("[Step 2/4] Generating test subgraphs...")
+        start_time = time.time()
         generate_subgraph_datasets(params, splits=['test'],
                                    saved_relation2id=graph_classifier.relation2id,
                                    max_label_value=graph_classifier.gnn.max_label_value)
+        logging.info(f"[Step 2/4] Subgraphs generated in {time.time() - start_time:.2f}s")
 
+        # Step 3: Load test dataset
+        logging.info("[Step 3/4] Loading test dataset...")
+        start_time = time.time()
         test = SubgraphDataset(params.db_path, 'test_pos', 'test_neg', params.file_paths, graph_classifier.relation2id,
                                add_traspose_rels=params.add_traspose_rels,
                                num_neg_samples_per_link=params.num_neg_samples_per_link,
                                use_kge_embeddings=params.use_kge_embeddings, dataset=params.dataset,
                                kge_model=params.kge_model, file_name=params.test_file)
+        logging.info(f"[Step 3/4] Dataset loaded in {time.time() - start_time:.2f}s")
+        logging.info(f"  Test samples: {len(test):,}")
 
+        # Step 4: Evaluate
+        logging.info("[Step 4/4] Evaluating...")
+        start_time = time.time()
         test_evaluator = Evaluator(params, graph_classifier, test)
-
         result = test_evaluator.eval(save=True)
-        logging.info('\nTest Set Performance:' + str(result))
+        logging.info(f"[Step 4/4] Evaluation completed in {time.time() - start_time:.2f}s")
+
+        logging.info(f'\nTest Set Performance: {result}')
         all_auc.append(result['auc'])
         auc_mean = auc_mean + (result['auc'] - auc_mean) / r
 
         all_auc_pr.append(result['auc_pr'])
         auc_pr_mean = auc_pr_mean + (result['auc_pr'] - auc_pr_mean) / r
 
-    auc_std = np.std(all_auc)
-    auc_pr_std = np.std(all_auc_pr)
-
-    logging.info('\nAvg test Set Performance -- mean auc :' + str(np.mean(all_auc)) + ' std auc: ' + str(np.std(all_auc)))
-    logging.info('\nAvg test Set Performance -- mean auc_pr :' + str(np.mean(all_auc_pr)) + ' std auc_pr: ' + str(np.std(all_auc_pr)))
+    # Final results
+    logging.info("=" * 50)
+    logging.info("FINAL RESULTS:")
+    logging.info(f'  AUC:    {np.mean(all_auc):.4f} ± {np.std(all_auc):.4f}')
+    logging.info(f'  AUC-PR: {np.mean(all_auc_pr):.4f} ± {np.std(all_auc_pr):.4f}')
 
 
 if __name__ == '__main__':
