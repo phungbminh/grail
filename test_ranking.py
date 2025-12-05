@@ -14,15 +14,13 @@ import torch
 import numpy as np
 import dgl
 
-# Import optimized functions from graph_sampler
-from utils.graph_utils import incidence_matrix as incidence_matrix_optimized
-
-# Try to import numba-optimized BFS
-try:
-    from utils.dgl_utils_numba import _bfs_relational_numba as _bfs_relational_fast
-    USE_NUMBA = True
-except ImportError:
-    USE_NUMBA = False
+# Import from graph_sampler to reuse existing functions
+from subgraph_extraction.graph_sampler import (
+    subgraph_extraction_labeling,
+    get_neighbor_nodes,
+    node_label
+)
+from utils.graph_utils import incidence_matrix
 
 
 def process_files(files, saved_relation2id, add_traspose_rels):
@@ -185,213 +183,6 @@ def get_neg_samples_replacing_head_tail_from_ruleN(ruleN_pred_path, entity2id, s
     return neg_triplets
 
 
-def incidence_matrix(adj_list):
-    '''
-    adj_list: List of sparse adjacency matrices
-    '''
-
-    rows, cols, dats = [], [], []
-    dim = adj_list[0].shape
-    for adj in adj_list:
-        adjcoo = adj.tocoo()
-        rows += adjcoo.row.tolist()
-        cols += adjcoo.col.tolist()
-        dats += adjcoo.data.tolist()
-    row = np.array(rows)
-    col = np.array(cols)
-    data = np.array(dats)
-    return ssp.csc_matrix((data, (row, col)), shape=dim)
-
-
-def _bfs_relational(adj, roots, max_nodes_per_hop=None):
-    """
-    BFS for graphs with multiple edge types. Returns list of level sets.
-    Each entry in list corresponds to relation specified by adj_list.
-    Modified from dgl.contrib.data.knowledge_graph to node accomodate sampling
-    """
-    visited = set()
-    current_lvl = set(roots)
-
-    next_lvl = set()
-
-    while current_lvl:
-
-        for v in current_lvl:
-            visited.add(v)
-
-        next_lvl = _get_neighbors(adj, current_lvl)
-        next_lvl -= visited  # set difference
-
-        if max_nodes_per_hop and max_nodes_per_hop < len(next_lvl):
-            next_lvl = set(random.sample(next_lvl, max_nodes_per_hop))
-
-        yield next_lvl
-
-        current_lvl = set.union(next_lvl)
-
-
-def _get_neighbors(adj, nodes):
-    """Takes a set of nodes and a graph adjacency matrix and returns a set of neighbors.
-    Directly copied from dgl.contrib.data.knowledge_graph"""
-    sp_nodes = _sp_row_vec_from_idx_list(list(nodes), adj.shape[1])
-    sp_neighbors = sp_nodes.dot(adj)
-    neighbors = set(ssp.find(sp_neighbors)[1])  # convert to set of indices
-    return neighbors
-
-
-def _sp_row_vec_from_idx_list(idx_list, dim):
-    """Create sparse vector of dimensionality dim from a list of indices."""
-    shape = (1, dim)
-    data = np.ones(len(idx_list))
-    row_ind = np.zeros(len(idx_list))
-    col_ind = list(idx_list)
-    return ssp.csr_matrix((data, (row_ind, col_ind)), shape=shape)
-
-
-def get_neighbor_nodes(roots, adj, h=1, max_nodes_per_hop=None):
-    # OPTIMIZATION: Use numba-optimized BFS if available (10-100x faster)
-    if USE_NUMBA:
-        bfs_generator = _bfs_relational_fast(adj, roots, max_nodes_per_hop)
-    else:
-        bfs_generator = _bfs_relational(adj, roots, max_nodes_per_hop)
-    lvls = list()
-    for _ in range(h):
-        try:
-            lvls.append(next(bfs_generator))
-        except StopIteration:
-            pass
-    return set().union(*lvls)
-
-
-def subgraph_extraction_labeling(ind, rel, A_list, h=1, enclosing_sub_graph=False, max_nodes_per_hop=None, node_information=None, max_node_label_value=None, A_incidence=None):
-    """
-    OPTIMIZED: Extract h-hop enclosing subgraphs around link 'ind'
-
-    Optimizations:
-    1. Use pre-computed A_incidence (avoid recomputation)
-    2. Use numba-optimized BFS
-    3. Use BFS instead of Dijkstra for labeling
-    4. Support semantic pruning
-    """
-    # OPTIMIZATION: Use pre-computed A_incidence if provided
-    if A_incidence is None:
-        A_incidence = incidence_matrix(A_list)
-        A_incidence += A_incidence.T
-
-    # OPTIMIZATION: Ensure CSR format for fast BFS
-    if not isinstance(A_incidence, ssp.csr_matrix):
-        A_incidence_csr = A_incidence.tocsr()
-    else:
-        A_incidence_csr = A_incidence
-
-    # Get neighbors using optimized BFS
-    root1_nei = get_neighbor_nodes(set([ind[0]]), A_incidence_csr, h, max_nodes_per_hop)
-    root2_nei = get_neighbor_nodes(set([ind[1]]), A_incidence_csr, h, max_nodes_per_hop)
-
-    subgraph_nei_nodes_int = root1_nei.intersection(root2_nei)
-    subgraph_nei_nodes_un = root1_nei.union(root2_nei)
-
-    # Extract subgraph | Roots being in the front is essential for labelling and the model to work properly.
-    if enclosing_sub_graph:
-        subgraph_nodes = list(ind) + list(subgraph_nei_nodes_int)
-    else:
-        subgraph_nodes = list(ind) + list(subgraph_nei_nodes_un)
-
-    subgraph = [adj[subgraph_nodes, :][:, subgraph_nodes] for adj in A_list]
-
-    # OPTIMIZATION: Use fast BFS-based labeling
-    labels, enclosing_subgraph_nodes = node_label_fast(incidence_matrix(subgraph), max_distance=h)
-
-    pruned_subgraph_nodes = np.array(subgraph_nodes)[enclosing_subgraph_nodes].tolist()
-    pruned_labels = labels[enclosing_subgraph_nodes]
-
-    if max_node_label_value is not None:
-        pruned_labels = np.array([np.minimum(label, max_node_label_value).tolist() for label in pruned_labels])
-
-    return pruned_subgraph_nodes, pruned_labels
-
-
-def remove_nodes(A_incidence, nodes):
-    idxs_wo_nodes = list(set(range(A_incidence.shape[1])) - set(nodes))
-    return A_incidence[idxs_wo_nodes, :][:, idxs_wo_nodes]
-
-
-def node_label_new(subgraph, max_distance=1):
-    # an implementation of the proposed double-radius node labeling (DRNd   L)
-    roots = [0, 1]
-    sgs_single_root = [remove_nodes(subgraph, [root]) for root in roots]
-    dist_to_roots = [np.clip(ssp.csgraph.dijkstra(sg, indices=[0], directed=False, unweighted=True, limit=1e6)[:, 1:], 0, 1e7) for r, sg in enumerate(sgs_single_root)]
-    dist_to_roots = np.array(list(zip(dist_to_roots[0][0], dist_to_roots[1][0])), dtype=int)
-
-    # dist_to_roots[np.abs(dist_to_roots) > 1e6] = 0
-    # dist_to_roots = dist_to_roots + 1
-    target_node_labels = np.array([[0, 1], [1, 0]])
-    labels = np.concatenate((target_node_labels, dist_to_roots)) if dist_to_roots.size else target_node_labels
-
-    enclosing_subgraph_nodes = np.where(np.max(labels, axis=1) <= max_distance)[0]
-    # print(len(enclosing_subgraph_nodes))
-    return labels, enclosing_subgraph_nodes
-
-
-def node_label_fast(subgraph, max_distance=1):
-    """
-    OPTIMIZED: Use BFS instead of Dijkstra for unweighted graphs (3-10x faster!)
-
-    BFS is O(V+E) vs Dijkstra O(E log V) for unweighted shortest paths.
-    """
-    roots = [0, 1]
-    sgs_single_root = [remove_nodes(subgraph, [root]) for root in roots]
-
-    dist_to_roots_list = []
-    for r, sg in enumerate(sgs_single_root):
-        # Use BFS for unweighted shortest paths (much faster than Dijkstra)
-        distances = _bfs_distances(sg, source=0)
-        distances = distances[1:]  # Skip source node
-        dist_to_roots_list.append(np.clip(distances, 0, 1e7))
-
-    dist_to_roots = np.array(list(zip(dist_to_roots_list[0], dist_to_roots_list[1])), dtype=int)
-
-    target_node_labels = np.array([[0, 1], [1, 0]])
-    labels = np.concatenate((target_node_labels, dist_to_roots)) if dist_to_roots.size else target_node_labels
-
-    enclosing_subgraph_nodes = np.where(np.max(labels, axis=1) <= max_distance)[0]
-    return labels, enclosing_subgraph_nodes
-
-
-def _bfs_distances(adj, source=0):
-    """
-    FAST BFS to compute distances from source to all nodes.
-    Much faster than Dijkstra for unweighted graphs.
-    """
-    n_nodes = adj.shape[0]
-    distances = np.full(n_nodes, 1e7, dtype=np.float64)
-    distances[source] = 0
-
-    # Convert to CSR for fast neighbor access
-    if not isinstance(adj, ssp.csr_matrix):
-        adj_csr = adj.tocsr()
-    else:
-        adj_csr = adj
-
-    # BFS using deque
-    queue = deque([source])
-    visited = {source}
-
-    while queue:
-        node = queue.popleft()
-        current_dist = distances[node]
-
-        # Get neighbors from CSR format
-        neighbors = adj_csr.indices[adj_csr.indptr[node]:adj_csr.indptr[node + 1]]
-
-        for neighbor in neighbors:
-            if neighbor not in visited:
-                visited.add(neighbor)
-                distances[neighbor] = current_dist + 1
-                queue.append(neighbor)
-
-    return distances
-
 
 def ssp_multigraph_to_dgl(graph, n_feats=None):
     """
@@ -445,8 +236,8 @@ def get_subgraphs(all_links, adj_list, dgl_adj_list, max_node_label_value, id2en
 
     for link in all_links:
         head, tail, rel = link[0], link[1], link[2]
-        # OPTIMIZATION: Use pre-computed A_incidence_ from worker initialization
-        nodes, node_labels = subgraph_extraction_labeling(
+        # Use subgraph_extraction_labeling from graph_sampler (returns 5 values)
+        nodes, node_labels, _, _, _ = subgraph_extraction_labeling(
             (head, tail), rel, adj_list,
             h=params_.hop,
             enclosing_sub_graph=params_.enclosing_sub_graph,
