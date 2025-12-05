@@ -308,10 +308,14 @@ def get_subgraphs(all_links, adj_list, dgl_adj_list, max_node_label_value, id2en
         subgraph.edata['type'] = dgl_adj_list.edata['type'][sub.edata[dgl.EID]]
         subgraph.edata['label'] = torch.tensor(rel * np.ones(subgraph.edata['type'].shape), dtype=torch.long)
 
-        edges_btw_roots = subgraph.edge_ids(0, 1)
-        rel_link = np.nonzero(subgraph.edata['type'][edges_btw_roots] == rel)
-
-        if rel_link.squeeze().nelement() == 0:
+        # Check if edge (0,1) exists, add if not
+        has_edge = subgraph.has_edges_between(0, 1)
+        if has_edge:
+            edges_btw_roots = subgraph.edge_ids(0, 1)
+            rel_link = np.nonzero(subgraph.edata['type'][edges_btw_roots] == rel)
+            if rel_link.squeeze().nelement() == 0:
+                subgraph = dgl.add_edges(subgraph, 0, 1, {'type': torch.tensor([rel]).long(), 'label': torch.tensor([rel]).long()})
+        else:
             subgraph = dgl.add_edges(subgraph, 0, 1, {'type': torch.tensor([rel]).long(), 'label': torch.tensor([rel]).long()})
 
         kge_nodes = [kge_entity2id[id2entity[n]] for n in nodes] if kge_entity2id else None
@@ -407,10 +411,14 @@ def get_subgraphs_gpu(all_links, adj_list, dgl_adj_list, max_node_label_value, i
         subgraph.edata['type'] = dgl_adj_list.edata['type'][sub.edata[dgl.EID]]
         subgraph.edata['label'] = torch.tensor(rel * np.ones(subgraph.edata['type'].shape), dtype=torch.long)
 
-        edges_btw_roots = subgraph.edge_ids(0, 1)
-        rel_link = np.nonzero(subgraph.edata['type'][edges_btw_roots] == rel)
-
-        if rel_link.squeeze().nelement() == 0:
+        # Check if edge (0,1) exists, add if not
+        has_edge = subgraph.has_edges_between(0, 1)
+        if has_edge:
+            edges_btw_roots = subgraph.edge_ids(0, 1)
+            rel_link = np.nonzero(subgraph.edata['type'][edges_btw_roots] == rel)
+            if rel_link.squeeze().nelement() == 0:
+                subgraph = dgl.add_edges(subgraph, 0, 1, {'type': torch.tensor([rel]).long(), 'label': torch.tensor([rel]).long()})
+        else:
             subgraph = dgl.add_edges(subgraph, 0, 1, {'type': torch.tensor([rel]).long(), 'label': torch.tensor([rel]).long()})
 
         kge_nodes = [kge_entity2id[id2entity[n]] for n in nodes] if kge_entity2id else None
