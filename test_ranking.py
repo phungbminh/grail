@@ -91,66 +91,134 @@ def intialize_worker(model, adj_list, dgl_adj_list, id2entity, params, node_feat
     semantic_embeddings_ = semantic_embeddings
 
 
-def get_neg_samples_replacing_head_tail(test_links, adj_list, num_samples=50):
+def _sample_neg_for_link(args):
+    """Worker function for parallel negative sampling."""
+    head, tail, rel, adj_rel_row, adj_rel_col, n, num_samples = args
 
-    n, r = adj_list[0].shape[0], len(adj_list)
+    neg_triplet = {'head': [[], 0], 'tail': [[], 0]}
+
+    # Head replacement: keep head fixed, sample negative tails
+    neg_triplet['head'][0].append([head, tail, rel])
+    # Get existing tails for this head in this relation
+    existing_tails = set(adj_rel_col)
+    existing_tails.add(head)  # exclude self-loop
+
+    candidates = np.array([i for i in range(n) if i not in existing_tails])
+    if len(candidates) >= num_samples - 1:
+        sampled = np.random.choice(candidates, num_samples - 1, replace=False)
+    else:
+        sampled = candidates
+
+    for neg_tail in sampled:
+        neg_triplet['head'][0].append([head, neg_tail, rel])
+
+    # Tail replacement: keep tail fixed, sample negative heads
+    neg_triplet['tail'][0].append([head, tail, rel])
+    # Get existing heads for this tail in this relation
+    existing_heads = set(adj_rel_row)
+    existing_heads.add(tail)  # exclude self-loop
+
+    candidates = np.array([i for i in range(n) if i not in existing_heads])
+    if len(candidates) >= num_samples - 1:
+        sampled = np.random.choice(candidates, num_samples - 1, replace=False)
+    else:
+        sampled = candidates
+
+    for neg_head in sampled:
+        neg_triplet['tail'][0].append([neg_head, tail, rel])
+
+    neg_triplet['head'][0] = np.array(neg_triplet['head'][0])
+    neg_triplet['tail'][0] = np.array(neg_triplet['tail'][0])
+
+    return neg_triplet
+
+
+def get_neg_samples_replacing_head_tail(test_links, adj_list, num_samples=50):
+    """
+    OPTIMIZED: Vectorized negative sampling with parallel processing.
+    """
+    n = adj_list[0].shape[0]
     heads, tails, rels = test_links[:, 0], test_links[:, 1], test_links[:, 2]
 
-    neg_triplets = []
-    for i, (head, tail, rel) in enumerate(zip(heads, tails, rels)):
-        neg_triplet = {'head': [[], 0], 'tail': [[], 0]}
-        neg_triplet['head'][0].append([head, tail, rel])
-        while len(neg_triplet['head'][0]) < num_samples:
-            neg_head = head
-            neg_tail = np.random.choice(n)
+    logging.info(f"  Preparing negative sampling for {len(heads)} test links...")
 
-            if neg_head != neg_tail and adj_list[rel][neg_head, neg_tail] == 0:
-                neg_triplet['head'][0].append([neg_head, neg_tail, rel])
+    # Pre-compute adjacency info for each relation
+    adj_coo = {i: adj.tocoo() for i, adj in enumerate(adj_list)}
 
-        neg_triplet['tail'][0].append([head, tail, rel])
-        while len(neg_triplet['tail'][0]) < num_samples:
-            neg_head = np.random.choice(n)
-            neg_tail = tail
-            # neg_head, neg_tail, rel = np.random.choice(n), np.random.choice(n), np.random.choice(r)
+    # Prepare arguments for parallel processing
+    args_list = []
+    for head, tail, rel in zip(heads, tails, rels):
+        coo = adj_coo[rel]
+        # Get row indices where head appears
+        head_mask = coo.row == head
+        adj_rel_col = coo.col[head_mask]
+        # Get col indices where tail appears
+        tail_mask = coo.col == tail
+        adj_rel_row = coo.row[tail_mask]
+        args_list.append((head, tail, rel, adj_rel_row, adj_rel_col, n, num_samples))
 
-            if neg_head != neg_tail and adj_list[rel][neg_head, neg_tail] == 0:
-                neg_triplet['tail'][0].append([neg_head, neg_tail, rel])
-
-        neg_triplet['head'][0] = np.array(neg_triplet['head'][0])
-        neg_triplet['tail'][0] = np.array(neg_triplet['tail'][0])
-
-        neg_triplets.append(neg_triplet)
+    # Parallel processing
+    logging.info(f"  Running parallel negative sampling...")
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        neg_triplets = list(tqdm(pool.imap(_sample_neg_for_link, args_list),
+                                  total=len(args_list), desc="Sampling negatives"))
 
     return neg_triplets
 
 
-def get_neg_samples_replacing_head_tail_all(test_links, adj_list):
+def _sample_neg_all_for_link(args):
+    """Worker function for parallel ALL negative sampling."""
+    head, tail, rel, adj_rel_row_set, adj_rel_col_set, n = args
 
-    n, r = adj_list[0].shape[0], len(adj_list)
+    neg_triplet = {'head': [[], 0], 'tail': [[], 0]}
+
+    # Head replacement: keep head fixed, get ALL valid negative tails
+    neg_triplet['head'][0].append([head, tail, rel])
+    for neg_tail in range(n):
+        if neg_tail != head and neg_tail not in adj_rel_col_set:
+            neg_triplet['head'][0].append([head, neg_tail, rel])
+
+    # Tail replacement: keep tail fixed, get ALL valid negative heads
+    neg_triplet['tail'][0].append([head, tail, rel])
+    for neg_head in range(n):
+        if neg_head != tail and neg_head not in adj_rel_row_set:
+            neg_triplet['tail'][0].append([neg_head, tail, rel])
+
+    neg_triplet['head'][0] = np.array(neg_triplet['head'][0])
+    neg_triplet['tail'][0] = np.array(neg_triplet['tail'][0])
+
+    return neg_triplet
+
+
+def get_neg_samples_replacing_head_tail_all(test_links, adj_list):
+    """
+    OPTIMIZED: Vectorized ALL negative sampling with parallel processing.
+    """
+    n = adj_list[0].shape[0]
     heads, tails, rels = test_links[:, 0], test_links[:, 1], test_links[:, 2]
 
-    neg_triplets = []
-    print('sampling negative triplets...')
-    for i, (head, tail, rel) in tqdm(enumerate(zip(heads, tails, rels)), total=len(heads)):
-        neg_triplet = {'head': [[], 0], 'tail': [[], 0]}
-        neg_triplet['head'][0].append([head, tail, rel])
-        for neg_tail in range(n):
-            neg_head = head
+    logging.info(f"  Preparing ALL negative sampling for {len(heads)} test links...")
 
-            if neg_head != neg_tail and adj_list[rel][neg_head, neg_tail] == 0:
-                neg_triplet['head'][0].append([neg_head, neg_tail, rel])
+    # Pre-compute adjacency info for each relation
+    adj_coo = {i: adj.tocoo() for i, adj in enumerate(adj_list)}
 
-        neg_triplet['tail'][0].append([head, tail, rel])
-        for neg_head in range(n):
-            neg_tail = tail
+    # Prepare arguments for parallel processing
+    args_list = []
+    for head, tail, rel in zip(heads, tails, rels):
+        coo = adj_coo[rel]
+        # Get existing (head, *) pairs -> set of tails
+        head_mask = coo.row == head
+        adj_rel_col_set = set(coo.col[head_mask])
+        # Get existing (*, tail) pairs -> set of heads
+        tail_mask = coo.col == tail
+        adj_rel_row_set = set(coo.row[tail_mask])
+        args_list.append((head, tail, rel, adj_rel_row_set, adj_rel_col_set, n))
 
-            if neg_head != neg_tail and adj_list[rel][neg_head, neg_tail] == 0:
-                neg_triplet['tail'][0].append([neg_head, neg_tail, rel])
-
-        neg_triplet['head'][0] = np.array(neg_triplet['head'][0])
-        neg_triplet['tail'][0] = np.array(neg_triplet['tail'][0])
-
-        neg_triplets.append(neg_triplet)
+    # Parallel processing
+    logging.info(f"  Running parallel ALL negative sampling with {mp.cpu_count()} workers...")
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        neg_triplets = list(tqdm(pool.imap(_sample_neg_all_for_link, args_list),
+                                  total=len(args_list), desc="Sampling ALL negatives"))
 
     return neg_triplets
 

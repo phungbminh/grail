@@ -381,7 +381,7 @@ def links2subgraphs(A, graphs, params, max_label_value=None, semantic_embeddings
 
         # Use all available cores for maximum speed
         import multiprocessing
-        max_workers = min(multiprocessing.cpu_count(), 16)  # Use all 16 cores
+        max_workers = min(multiprocessing.cpu_count(), 30)  # Use all 16 cores
         logging.info(f"Using {max_workers} cores for subgraph extraction")
 
         # OPTIMIZATION: Extract ALL to memory first (no disk I/O bottleneck!)
@@ -511,7 +511,7 @@ def extract_save_subgraph(args_):
         # FAST PATH: Use optimized unified BFS + lazy labeling
         from subgraph_extraction.semantic_pruning import fast_subgraph_extraction
 
-        target_size = getattr(params_, 'max_nodes_per_hop', 200)
+        target_size = getattr(params_, 'target_subgraph_size', getattr(params_, 'max_nodes_per_hop', 200))
         stage1_ratio = getattr(params_, 'stage1_ratio', 10)
         alpha = getattr(params_, 'path_weight', 0.6)
         beta = getattr(params_, 'semantic_weight', 0.4)
