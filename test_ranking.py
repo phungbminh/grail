@@ -170,15 +170,15 @@ def get_neg_samples_replacing_head_tail(test_links, adj_list, num_samples=50):
 
 def get_neg_samples_replacing_head_tail_all(test_links, adj_list):
     """
-    ULTRA-FAST: Pure numpy vectorized ALL negative sampling - NO multiprocessing overhead.
-    For 162K links, multiprocessing has too much serialization overhead.
-    Single-thread numpy is faster.
+    MEMORY-EFFICIENT: Generator-based ALL negative sampling.
+    Returns a generator instead of list to avoid OOM with large datasets.
     """
     n = adj_list[0].shape[0]
     num_links = len(test_links)
     heads, tails, rels = test_links[:, 0], test_links[:, 1], test_links[:, 2]
 
-    logging.info(f"  Generating ALL negatives for {num_links:,} test links (n={n:,} entities)...")
+    logging.info(f"  Preparing ALL negatives for {num_links:,} test links (n={n:,} entities)...")
+    logging.info(f"  Estimated memory: {num_links * n * 3 * 8 / 1e9:.1f} GB (will use streaming to avoid OOM)")
 
     # Pre-compute sparse adjacency as numpy arrays for vectorized operations
     logging.info(f"  Building adjacency index for {len(adj_list)} relations...")
@@ -195,46 +195,47 @@ def get_neg_samples_replacing_head_tail_all(test_links, adj_list):
                 adj_tail_to_heads[rel_idx][t] = set()
             adj_tail_to_heads[rel_idx][t].add(h)
 
-    logging.info(f"  Generating negative samples (vectorized)...")
-    neg_triplets = []
+    logging.info(f"  Adjacency index built. Starting generation...")
+
+    # Return generator to avoid OOM
     all_entities = np.arange(n, dtype=np.int64)
 
-    for i in tqdm(range(num_links), desc="Generating ALL negatives"):
-        head, tail, rel = int(heads[i]), int(tails[i]), int(rels[i])
+    def neg_generator():
+        for i in range(num_links):
+            head, tail, rel = int(heads[i]), int(tails[i]), int(rels[i])
 
-        # Head replacement: get ALL valid negative tails
-        exclude_tails = adj_head_to_tails[rel].get(head, set()) | {head}
-        valid_mask = np.ones(n, dtype=bool)
-        valid_mask[list(exclude_tails)] = False
-        valid_neg_tails = all_entities[valid_mask]
+            # Head replacement: get ALL valid negative tails
+            exclude_tails = adj_head_to_tails[rel].get(head, set()) | {head}
+            valid_mask = np.ones(n, dtype=bool)
+            valid_mask[list(exclude_tails)] = False
+            valid_neg_tails = all_entities[valid_mask]
 
-        num_head_negs = len(valid_neg_tails) + 1
-        head_negs = np.empty((num_head_negs, 3), dtype=np.int64)
-        head_negs[:, 0] = head
-        head_negs[0, 1] = tail
-        head_negs[1:, 1] = valid_neg_tails
-        head_negs[:, 2] = rel
+            num_head_negs = len(valid_neg_tails) + 1
+            head_negs = np.empty((num_head_negs, 3), dtype=np.int64)
+            head_negs[:, 0] = head
+            head_negs[0, 1] = tail
+            head_negs[1:, 1] = valid_neg_tails
+            head_negs[:, 2] = rel
 
-        # Tail replacement: get ALL valid negative heads
-        exclude_heads = adj_tail_to_heads[rel].get(tail, set()) | {tail}
-        valid_mask = np.ones(n, dtype=bool)
-        valid_mask[list(exclude_heads)] = False
-        valid_neg_heads = all_entities[valid_mask]
+            # Tail replacement: get ALL valid negative heads
+            exclude_heads = adj_tail_to_heads[rel].get(tail, set()) | {tail}
+            valid_mask = np.ones(n, dtype=bool)
+            valid_mask[list(exclude_heads)] = False
+            valid_neg_heads = all_entities[valid_mask]
 
-        num_tail_negs = len(valid_neg_heads) + 1
-        tail_negs = np.empty((num_tail_negs, 3), dtype=np.int64)
-        tail_negs[0, 0] = head
-        tail_negs[1:, 0] = valid_neg_heads
-        tail_negs[:, 1] = tail
-        tail_negs[:, 2] = rel
+            num_tail_negs = len(valid_neg_heads) + 1
+            tail_negs = np.empty((num_tail_negs, 3), dtype=np.int64)
+            tail_negs[0, 0] = head
+            tail_negs[1:, 0] = valid_neg_heads
+            tail_negs[:, 1] = tail
+            tail_negs[:, 2] = rel
 
-        neg_triplets.append({
-            'head': [head_negs, 0],
-            'tail': [tail_negs, 0]
-        })
+            yield {
+                'head': [head_negs, 0],
+                'tail': [tail_negs, 0]
+            }
 
-    logging.info(f"  Done! Generated {len(neg_triplets):,} negative triplet sets")
-    return neg_triplets
+    return neg_generator(), num_links  # Return generator and length
 
 
 def get_neg_samples_replacing_head_tail_from_ruleN(ruleN_pred_path, entity2id, saved_relation2id):
@@ -544,15 +545,22 @@ def main(params):
     logger.info("=" * 50)
     logger.info("[Step 5/6] Generating negative samples...")
     start_time = time.time()
+    neg_triplets = None
+    neg_generator = None
+    num_neg_triplets = 0
+
     if params.mode == 'sample':
         neg_triplets = get_neg_samples_replacing_head_tail(triplets['links'], adj_list)
+        num_neg_triplets = len(neg_triplets)
         save_to_file(neg_triplets, id2entity, id2relation)
     elif params.mode == 'all':
-        neg_triplets = get_neg_samples_replacing_head_tail_all(triplets['links'], adj_list)
+        # Returns (generator, num_links) to avoid OOM
+        neg_generator, num_neg_triplets = get_neg_samples_replacing_head_tail_all(triplets['links'], adj_list)
     elif params.mode == 'ruleN':
         neg_triplets = get_neg_samples_replacing_head_tail_from_ruleN(params.ruleN_pred_path, entity2id, relation2id)
-    logger.info(f"[Step 5/6] Negative samples generated in {time.time() - start_time:.2f}s")
-    logger.info(f"  - Total neg triplets: {len(neg_triplets):,}")
+        num_neg_triplets = len(neg_triplets)
+    logger.info(f"[Step 5/6] Negative samples prepared in {time.time() - start_time:.2f}s")
+    logger.info(f"  - Total neg triplets: {num_neg_triplets:,}")
 
     # Step 6: Compute rankings
     logger.info("=" * 50)
@@ -563,11 +571,14 @@ def main(params):
     all_head_scores = []
     all_tail_scores = []
 
+    # Determine the data source: generator (for 'all' mode) or list (for other modes)
+    data_source = neg_generator if neg_generator is not None else neg_triplets
+
     # Use GPU single-thread mode if CUDA is available (faster for inference)
     # Use CPU multiprocessing mode otherwise
     if params.device.type == 'cuda':
         logger.info(f"Using GPU mode (single-thread) on {params.device}")
-        for i, neg_link in enumerate(tqdm(neg_triplets, desc="Computing ranks (GPU)")):
+        for i, neg_link in enumerate(tqdm(data_source, total=num_neg_triplets, desc="Computing ranks (GPU)")):
             head_scores, head_rank, tail_scores, tail_rank = get_rank_gpu(
                 neg_link, model, adj_list, dgl_adj_list, id2entity, params,
                 node_features, kge_entity2id, A_incidence_precomputed, params.device
@@ -577,18 +588,19 @@ def main(params):
             all_head_scores += head_scores.tolist()
             all_tail_scores += tail_scores.tolist()
 
+
             # Log progress every 100 links
             if (i + 1) % 100 == 0:
                 elapsed = time.time() - start_time
-                eta = elapsed / (i + 1) * (len(neg_triplets) - i - 1)
-                logger.info(f"  Progress: {i+1}/{len(neg_triplets)} | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s")
+                eta = elapsed / (i + 1) * (num_neg_triplets - i - 1)
+                logger.info(f"  Progress: {i+1}/{num_neg_triplets} | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s")
     else:
         logger.info("Using CPU mode (multiprocessing)")
         # Pass pre-computed A_incidence to workers
         init_args = (model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id, A_incidence_precomputed, semantic_embeddings)
 
         with mp.Pool(processes=None, initializer=intialize_worker, initargs=init_args) as p:
-            for head_scores, head_rank, tail_scores, tail_rank in tqdm(p.imap(get_rank, neg_triplets), total=len(neg_triplets), desc="Computing ranks (CPU)"):
+            for head_scores, head_rank, tail_scores, tail_rank in tqdm(p.imap(get_rank, data_source), total=num_neg_triplets, desc="Computing ranks (CPU)"):
                 ranks.append(head_rank)
                 ranks.append(tail_rank)
 
@@ -602,6 +614,9 @@ def main(params):
     logger.info("Saving results...")
     if params.mode == 'ruleN':
         save_score_to_file_from_ruleN(neg_triplets, all_head_scores, all_tail_scores, id2entity, id2relation)
+    elif params.mode == 'all':
+        # Skip saving for 'all' mode - too large (162K links x 45K entities per link)
+        logger.info("  Skipping score file save for 'all' mode (too large)")
     else:
         save_score_to_file(neg_triplets, all_head_scores, all_tail_scores, id2entity, id2relation)
 
