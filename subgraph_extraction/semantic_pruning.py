@@ -649,7 +649,15 @@ def prune_subgraph_nodes(
 # =============================================================================
 
 # Global cache for pre-normalized embeddings
+# FIX #4: Limit cache size to prevent memory leak in edge cases
 _normalized_embeddings_cache = {}
+_CACHE_MAX_SIZE = 5  # Max 5 embeddings cached (prevents unbounded growth)
+
+
+def clear_normalized_embeddings_cache():
+    """Clear the embeddings cache (call this if memory is an issue)."""
+    global _normalized_embeddings_cache
+    _normalized_embeddings_cache.clear()
 
 
 def get_normalized_embeddings(embeddings, use_float32=True):
@@ -667,6 +675,12 @@ def get_normalized_embeddings(embeddings, use_float32=True):
     emb_id = id(embeddings)
     if emb_id in _normalized_embeddings_cache:
         return _normalized_embeddings_cache[emb_id]
+
+    # FIX #4: Limit cache size to prevent memory leak
+    if len(_normalized_embeddings_cache) >= _CACHE_MAX_SIZE:
+        # Remove oldest entry (FIFO)
+        oldest_key = next(iter(_normalized_embeddings_cache))
+        del _normalized_embeddings_cache[oldest_key]
 
     try:
         import torch
@@ -803,7 +817,18 @@ def unified_bfs_and_prune(
     other_arr = np.array(other_nodes, dtype=np.int64)
     path_scores = _compute_path_scores_array(other_arr, dist_from_u, dist_from_v)
 
-    stage1_size = min(target_size * stage1_ratio, len(other_nodes))
+    # FIX #3: ADAPTIVE STAGE1_RATIO - Reduces overhead for very large subgraphs
+    # When other_nodes is huge, using full stage1_ratio creates too many candidates
+    # for Stage 2 semantic scoring, causing 50-100ms overhead per subgraph
+    effective_stage1_ratio = stage1_ratio
+    if len(other_nodes) > target_size * 50:
+        # Very large subgraph: reduce stage1_ratio to speed up Stage 2
+        effective_stage1_ratio = max(3, stage1_ratio // 2)
+    elif len(other_nodes) > target_size * 20:
+        # Large subgraph: slightly reduce stage1_ratio
+        effective_stage1_ratio = max(5, int(stage1_ratio * 0.7))
+
+    stage1_size = min(target_size * effective_stage1_ratio, len(other_nodes))
     top_idx = np.argpartition(path_scores, -stage1_size)[-stage1_size:]
     stage1_nodes = other_arr[top_idx]
     stage1_scores = path_scores[top_idx]

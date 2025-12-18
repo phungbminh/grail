@@ -390,11 +390,23 @@ def links2subgraphs(A, graphs, params, max_label_value=None, semantic_embeddings
         max_workers = max(max_workers, 4)  # At least 4 workers
         logging.info(f"Using {max_workers} cores for subgraph extraction (CPU: {cpu_count}, optimized for low context switches)")
 
-        # OPTIMIZATION: Extract ALL to memory first (no disk I/O bottleneck!)
-        logging.info(f"Extracting {len(links):,} subgraphs to memory (parallel)...")
-        all_results = []
+        # FIX #1: STREAM TO LMDB - Prevents memory accumulation bottleneck!
+        # Old approach: accumulate all results in memory → GC pressure → slowdown
+        # New approach: batch write to LMDB every N items → constant memory usage
+        logging.info(f"Extracting {len(links):,} subgraphs with STREAMING to LMDB...")
+
+        # Batch size for LMDB writes (balance between memory and I/O efficiency)
+        BATCH_SIZE = 10000  # Write every 10k items
+        batch_results = []
+        total_written = 0
+        total_bytes = 0
 
         extraction_start = time.time()
+
+        # Write metadata first
+        with env.begin(write=True, db=split_env) as txn:
+            txn.put('num_graphs'.encode(), (len(links)).to_bytes(int.bit_length(len(links)), byteorder='little'))
+
         with mp.Pool(processes=max_workers, initializer=intialize_worker, initargs=init_args) as p:
             args_ = zip(range(len(links)), links, g_labels)
             # OPTIMIZED: Larger chunksize reduces IPC overhead significantly
@@ -402,6 +414,7 @@ def links2subgraphs(A, graphs, params, max_label_value=None, semantic_embeddings
             # This reduces IPC overhead by 8-16x
             optimal_chunksize = max(32, len(links) // (max_workers * 100))
             optimal_chunksize = min(optimal_chunksize, 128)  # Cap at 128
+
             for result in tqdm(p.imap_unordered(extract_save_subgraph, args_, chunksize=optimal_chunksize), total=len(links)):
                 str_id, serialized_datum, sg_size, enc_ratio, n_pruned, n_labels = result
 
@@ -410,52 +423,69 @@ def links2subgraphs(A, graphs, params, max_label_value=None, semantic_embeddings
                 enc_ratios.append(enc_ratio)
                 num_pruned_nodes.append(n_pruned)
 
-                # Store in memory (no disk write yet!)
-                all_results.append((str_id, serialized_datum))
+                # Add to batch
+                batch_results.append((str_id, serialized_datum))
+                total_bytes += len(serialized_datum)
+
+                # Flush batch to LMDB when full (prevents memory accumulation!)
+                if len(batch_results) >= BATCH_SIZE:
+                    with env.begin(write=True, db=split_env) as txn:
+                        for batch_str_id, batch_data in batch_results:
+                            txn.put(batch_str_id, batch_data)
+                    total_written += len(batch_results)
+                    batch_results.clear()  # Free memory immediately!
+
+                    # Log progress
+                    if total_written % 50000 == 0:
+                        elapsed = time.time() - extraction_start
+                        speed = total_written / elapsed
+                        logging.info(f"  Streamed {total_written:,}/{len(links):,} to LMDB ({speed:.0f} items/sec)")
+
+            # Flush remaining items
+            if batch_results:
+                with env.begin(write=True, db=split_env) as txn:
+                    for batch_str_id, batch_data in batch_results:
+                        txn.put(batch_str_id, batch_data)
+                total_written += len(batch_results)
+                batch_results.clear()
 
         extraction_time = time.time() - extraction_start
-
-        # Calculate memory usage
-        total_bytes = sum(len(data) for _, data in all_results)
         total_gb = total_bytes / (1024**3)
-        logging.info(f"Extraction completed in {extraction_time:.1f}s ({len(all_results):,} subgraphs)")
-        logging.info(f"Memory usage: {total_gb:.2f} GB ({total_bytes/len(all_results):.0f} bytes/subgraph)")
-
-        # MEGA-OPTIMIZATION: Single LMDB transaction for ALL data (10-100x faster!)
-        logging.info(f"Writing {len(all_results):,} subgraphs to LMDB in ONE transaction...")
-        write_start = time.time()
-
-        with env.begin(write=True, db=split_env) as txn:
-            # Write metadata
-            txn.put('num_graphs'.encode(), (len(links)).to_bytes(int.bit_length(len(links)), byteorder='little'))
-
-            # Write all subgraphs in single transaction
-            for i, (str_id, serialized_datum) in enumerate(all_results):
-                txn.put(str_id, serialized_datum)
-
-                # Progress update every 10k items
-                if (i + 1) % 10000 == 0:
-                    logging.info(f"  Written {i+1:,}/{len(all_results):,} items...")
-
-        write_time = time.time() - write_start
-        logging.info(f"LMDB write completed in {write_time:.1f}s ({len(all_results)/write_time:.0f} items/sec)")
-        logging.info(f"Total time: extraction={extraction_time:.1f}s + write={write_time:.1f}s = {extraction_time+write_time:.1f}s")
-
-        # Clear memory
-        all_results.clear()
+        logging.info(f"Extraction + streaming completed in {extraction_time:.1f}s ({total_written:,} subgraphs)")
+        logging.info(f"Total data: {total_gb:.2f} GB ({total_bytes/total_written:.0f} bytes/subgraph)")
+        logging.info(f"Throughput: {total_written/extraction_time:.0f} items/sec (streaming mode)")
 
     for split_name, split in graphs.items():
+        # FIX #2: SHUFFLE DATA - Prevents high-degree entity clustering!
+        # Without shuffling, entities with similar IDs (often similar degree) cluster together
+        # This causes some workers to get all "hard" subgraphs → uneven load → slowdown
         logging.info(f"Extracting enclosing subgraphs for positive links in {split_name} set")
-        labels = np.ones(len(split['pos']))
+        pos_links = split['pos']
+        pos_labels = np.ones(len(pos_links))
+
+        # Shuffle to distribute high-degree entities evenly across extraction
+        shuffle_idx = np.random.permutation(len(pos_links))
+        pos_links_shuffled = pos_links[shuffle_idx]
+        pos_labels_shuffled = pos_labels[shuffle_idx]
+        logging.info(f"  Shuffled {len(pos_links):,} positive links for balanced workload")
+
         db_name_pos = split_name + '_pos'
         split_env = env.open_db(db_name_pos.encode())
-        extraction_helper(A, split['pos'], labels, split_env)
+        extraction_helper(A, pos_links_shuffled, pos_labels_shuffled, split_env)
 
         logging.info(f"Extracting enclosing subgraphs for negative links in {split_name} set")
-        labels = np.zeros(len(split['neg']))
+        neg_links = split['neg']
+        neg_labels = np.zeros(len(neg_links))
+
+        # Shuffle negative links too
+        shuffle_idx = np.random.permutation(len(neg_links))
+        neg_links_shuffled = neg_links[shuffle_idx]
+        neg_labels_shuffled = neg_labels[shuffle_idx]
+        logging.info(f"  Shuffled {len(neg_links):,} negative links for balanced workload")
+
         db_name_neg = split_name + '_neg'
         split_env = env.open_db(db_name_neg.encode())
-        extraction_helper(A, split['neg'], labels, split_env)
+        extraction_helper(A, neg_links_shuffled, neg_labels_shuffled, split_env)
 
     max_n_label['value'] = max_label_value if max_label_value is not None else max_n_label['value']
 

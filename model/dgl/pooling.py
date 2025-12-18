@@ -3,8 +3,12 @@ Graph Pooling Strategies for GraIL
 
 Implements various graph-level pooling methods:
 - Baseline: mean, sum, max pooling
-- Attention-based: global attention, multi-head attention
-- Query-based: attention conditioned on head/tail entities
+- Query-based attention: conditioned on head/tail entities (RECOMMENDED for link prediction)
+
+For link prediction tasks, QueryAttentionPooling is recommended because:
+1. It conditions attention on the specific (head, tail) pair being predicted
+2. Nodes relevant to the link get higher attention weights
+3. Multi-head version learns diverse importance perspectives
 """
 
 import torch
@@ -15,12 +19,16 @@ import dgl
 
 class GraphPooling(nn.Module):
     """
-    Unified graph pooling module with multiple strategies.
+    Unified graph pooling module for link prediction.
 
     Args:
         emb_dim: Node embedding dimension
-        pool_type: Pooling strategy ('mean', 'sum', 'max', 'attention', 'query_attention')
-        num_heads: Number of attention heads (for multi-head attention)
+        pool_type: Pooling strategy
+            - 'mean', 'sum', 'max': Simple aggregation (fast, no learnable params)
+            - 'query_attention': Query-conditioned attention (RECOMMENDED)
+        num_heads: Number of attention heads (only for query_attention)
+            - 1: Single-head (faster, fewer params)
+            - 2-8: Multi-head (learns diverse perspectives)
         dropout: Dropout rate for attention weights
         hidden_dim: Hidden dimension for attention MLP
     """
@@ -34,34 +42,27 @@ class GraphPooling(nn.Module):
             hidden_dim = emb_dim // 2
 
         # Initialize pooling module based on type
-        if pool_type == 'attention':
-            if num_heads == 1:
-                self.pooling = GlobalAttentionPooling(emb_dim, hidden_dim, dropout)
-            else:
-                self.pooling = MultiHeadAttentionPooling(emb_dim, num_heads, dropout, hidden_dim)
-        elif pool_type == 'query_attention':
-            if num_heads == 1:
-                self.pooling = QueryAttentionPooling(emb_dim, hidden_dim, dropout)
-            else:
-                # Multi-head query attention
-                self.pooling = MultiHeadQueryAttentionPooling(emb_dim, num_heads, dropout, hidden_dim)
+        if pool_type == 'query_attention':
+            self.pooling = QueryAttentionPooling(emb_dim, num_heads, dropout, hidden_dim)
         elif pool_type in ['mean', 'sum', 'max']:
             self.pooling = None  # Use DGL built-in
         else:
-            raise ValueError(f"Unknown pooling type: {pool_type}")
+            raise ValueError(f"Unknown pooling type: {pool_type}. Use 'mean', 'sum', 'max', or 'query_attention'")
 
-    def forward(self, g, node_features, head_ids=None, tail_ids=None):
+    def forward(self, g, node_features, head_ids=None, tail_ids=None, return_attention=False):
         """
         Pool node features to graph-level representation.
 
         Args:
             g: DGL graph (batched)
             node_features: Node features (N x emb_dim)
-            head_ids: Head entity IDs for query attention (optional)
-            tail_ids: Tail entity IDs for query attention (optional)
+            head_ids: Head entity IDs for query attention
+            tail_ids: Tail entity IDs for query attention
+            return_attention: If True, return attention weights (only for query_attention)
 
         Returns:
-            Graph-level representation (batch_size x emb_dim)
+            graph_repr: Graph-level representation (batch_size x emb_dim)
+            attention_weights: (optional) Attention weights for analysis
         """
         if self.pool_type == 'mean':
             return dgl.mean_nodes(g, 'repr')
@@ -69,71 +70,48 @@ class GraphPooling(nn.Module):
             return dgl.sum_nodes(g, 'repr')
         elif self.pool_type == 'max':
             return dgl.max_nodes(g, 'repr')
-        elif self.pool_type == 'attention':
-            return self.pooling(g, node_features)
         elif self.pool_type == 'query_attention':
             if head_ids is None or tail_ids is None:
                 raise ValueError("query_attention requires head_ids and tail_ids")
-            return self.pooling(g, node_features, head_ids, tail_ids)
+            return self.pooling(g, node_features, head_ids, tail_ids, return_attention)
         else:
             raise ValueError(f"Unknown pooling type: {self.pool_type}")
 
 
-class GlobalAttentionPooling(nn.Module):
+class QueryAttentionPooling(nn.Module):
     """
-    Global attention pooling: learns importance weights for each node.
+    Query-based attention pooling for link prediction.
 
-    g = Σ α_i * h_i, where α_i = softmax(MLP(h_i))
+    Attention is conditioned on head/tail entities:
+        α_i = softmax(score(h_i, [h_head; h_tail]))
+
+    This is the RECOMMENDED pooling for link prediction because:
+    1. It knows which link (head, tail) is being predicted
+    2. Nodes relevant to the specific link get higher weights
+    3. Multi-head learns diverse importance aspects
+
+    Args:
+        emb_dim: Node embedding dimension
+        num_heads: Number of attention heads
+            - 1: Single-head attention (simple, fast)
+            - 2-8: Multi-head attention (learns diverse perspectives)
+        dropout: Dropout rate for attention
+        hidden_dim: Hidden dimension for attention MLP
+
+    Example:
+        # Single-head (simple)
+        pooling = QueryAttentionPooling(emb_dim=64, num_heads=1)
+
+        # Multi-head (recommended for complex graphs)
+        pooling = QueryAttentionPooling(emb_dim=64, num_heads=4)
+
+        # Forward pass
+        graph_repr = pooling(g, node_features, head_ids, tail_ids)
+
+        # Get attention weights for analysis
+        graph_repr, attn_weights = pooling(g, node_features, head_ids, tail_ids, return_attention=True)
     """
-    def __init__(self, emb_dim, hidden_dim, dropout=0.0):
-        super().__init__()
-        self.emb_dim = emb_dim
-
-        # Attention scoring MLP
-        self.attention_mlp = nn.Sequential(
-            nn.Linear(emb_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)
-        )
-
-    def forward(self, g, node_features):
-        """
-        Args:
-            g: Batched DGL graph
-            node_features: Node features (N x emb_dim)
-
-        Returns:
-            Graph representations (batch_size x emb_dim)
-        """
-        # Compute attention scores for each node
-        # scores: (N x 1)
-        scores = self.attention_mlp(node_features)
-
-        # Apply softmax per graph in batch
-        # attention_weights: (N x 1)
-        g.ndata['score'] = scores
-        g.ndata['h'] = node_features
-
-        # Softmax normalization within each graph
-        attention_weights = dgl.softmax_nodes(g, 'score')
-        g.ndata['alpha'] = attention_weights
-
-        # Weighted sum: g = Σ α_i * h_i
-        g.ndata['weighted_h'] = g.ndata['alpha'] * g.ndata['h']
-        graph_repr = dgl.sum_nodes(g, 'weighted_h')
-
-        return graph_repr
-
-
-class MultiHeadAttentionPooling(nn.Module):
-    """
-    Multi-head attention pooling: multiple attention mechanisms in parallel.
-
-    Each head learns different aspects of node importance.
-    Final representation: concat(head_1, ..., head_K) or mean(head_1, ..., head_K)
-    """
-    def __init__(self, emb_dim, num_heads=4, dropout=0.0, hidden_dim=None):
+    def __init__(self, emb_dim, num_heads=1, dropout=0.0, hidden_dim=None):
         super().__init__()
         self.emb_dim = emb_dim
         self.num_heads = num_heads
@@ -141,99 +119,70 @@ class MultiHeadAttentionPooling(nn.Module):
         if hidden_dim is None:
             hidden_dim = emb_dim // 2
 
-        # Multiple attention heads
-        self.attention_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(emb_dim, hidden_dim),
+        if num_heads == 1:
+            # Single-head: simpler architecture
+            self.head_dim = emb_dim
+            self.value_projection = nn.Linear(emb_dim, emb_dim)
+
+            # Attention scoring: [node; head; tail] -> score
+            self.attention_mlp = nn.Sequential(
+                nn.Linear(3 * emb_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, 1)
             )
-            for _ in range(num_heads)
-        ])
 
-        # Projection to combine heads (if using concat)
-        # We'll use mean instead to keep output dimension = emb_dim
-        self.combine_type = 'mean'  # or 'concat'
+            self.output_projection = None  # No need for single head
+            self.layer_norm = nn.LayerNorm(emb_dim)
+        else:
+            # Multi-head: each head learns different aspects
+            assert emb_dim % num_heads == 0, f"emb_dim ({emb_dim}) must be divisible by num_heads ({num_heads})"
+            self.head_dim = emb_dim // num_heads
 
-    def forward(self, g, node_features):
+            # Value projection for each head
+            self.value_projections = nn.ModuleList([
+                nn.Linear(emb_dim, self.head_dim)
+                for _ in range(num_heads)
+            ])
+
+            # Attention scoring for each head
+            self.attention_heads = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(3 * emb_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, 1)
+                )
+                for _ in range(num_heads)
+            ])
+
+            # Output projection after concatenation
+            self.output_projection = nn.Linear(emb_dim, emb_dim)
+            self.layer_norm = nn.LayerNorm(emb_dim)
+
+    def forward(self, g, node_features, head_ids, tail_ids, return_attention=False):
         """
         Args:
             g: Batched DGL graph
             node_features: Node features (N x emb_dim)
+            head_ids: Head entity indices (batch_size,)
+            tail_ids: Tail entity indices (batch_size,)
+            return_attention: If True, return attention weights for analysis
 
         Returns:
-            Graph representations (batch_size x emb_dim)
-        """
-        head_outputs = []
-
-        for head_idx, attention_head in enumerate(self.attention_heads):
-            # Compute attention scores for this head
-            scores = attention_head(node_features)
-
-            # Store in unique key for this head
-            g.ndata[f'score_{head_idx}'] = scores
-
-            # Softmax normalization
-            attention_weights = dgl.softmax_nodes(g, f'score_{head_idx}')
-
-            # Weighted sum
-            g.ndata[f'weighted_h_{head_idx}'] = attention_weights * node_features
-            head_repr = dgl.sum_nodes(g, f'weighted_h_{head_idx}')
-            head_outputs.append(head_repr)
-
-        # Combine heads
-        if self.combine_type == 'mean':
-            # Average across heads: (batch_size x emb_dim)
-            graph_repr = torch.mean(torch.stack(head_outputs, dim=0), dim=0)
-        elif self.combine_type == 'concat':
-            # Concatenate heads: (batch_size x (num_heads * emb_dim))
-            graph_repr = torch.cat(head_outputs, dim=1)
-
-        return graph_repr
-
-
-class QueryAttentionPooling(nn.Module):
-    """
-    Query-based attention pooling: attention conditioned on head/tail entities.
-
-    Uses head and tail embeddings as queries to determine node importance.
-    α_i = softmax(score(h_i, [h_head; h_tail]))
-    """
-    def __init__(self, emb_dim, hidden_dim, dropout=0.0):
-        super().__init__()
-        self.emb_dim = emb_dim
-
-        # Attention scoring MLP conditioned on query
-        # Input: [node_emb; query_emb] = [emb_dim; 2*emb_dim] = 3*emb_dim
-        self.attention_mlp = nn.Sequential(
-            nn.Linear(3 * emb_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)
-        )
-
-    def forward(self, g, node_features, head_ids, tail_ids):
-        """
-        Args:
-            g: Batched DGL graph
-            node_features: Node features (N x emb_dim)
-            head_ids: Head entity indices in each graph (batch_size,)
-            tail_ids: Tail entity indices in each graph (batch_size,)
-
-        Returns:
-            Graph representations (batch_size x emb_dim)
+            graph_repr: Graph representations (batch_size x emb_dim)
+            attention_weights: (optional)
+                - Single-head: (N x 1) tensor
+                - Multi-head: list of (N x 1) tensors, one per head
         """
         batch_num_nodes = g.batch_num_nodes()
-        batch_size = len(batch_num_nodes)
 
-        # Extract head and tail embeddings
+        # Build query from head/tail embeddings
         head_embeds = node_features[head_ids]  # (batch_size x emb_dim)
         tail_embeds = node_features[tail_ids]  # (batch_size x emb_dim)
         query_embeds = torch.cat([head_embeds, tail_embeds], dim=1)  # (batch_size x 2*emb_dim)
 
-        # Expand query to all nodes in each graph
-        # Create mapping from node to its graph
+        # Map each node to its graph for broadcasting
         graph_ids = torch.cat([
             torch.full((n,), i, dtype=torch.long, device=node_features.device)
             for i, n in enumerate(batch_num_nodes)
@@ -241,86 +190,88 @@ class QueryAttentionPooling(nn.Module):
 
         # Broadcast query to all nodes
         node_queries = query_embeds[graph_ids]  # (N x 2*emb_dim)
-
-        # Concatenate node features with query
         node_query_concat = torch.cat([node_features, node_queries], dim=1)  # (N x 3*emb_dim)
+
+        if self.num_heads == 1:
+            return self._single_head_forward(g, node_features, node_query_concat, return_attention)
+        else:
+            return self._multi_head_forward(g, node_features, node_query_concat, return_attention)
+
+    def _single_head_forward(self, g, node_features, node_query_concat, return_attention):
+        """Single-head attention forward pass."""
+        # Project values
+        projected_values = self.value_projection(node_features)  # (N x emb_dim)
 
         # Compute attention scores
         scores = self.attention_mlp(node_query_concat)  # (N x 1)
-
-        # Softmax and weighted sum (same as GlobalAttentionPooling)
         g.ndata['score'] = scores
-        g.ndata['h'] = node_features
+
+        # Softmax per graph
         attention_weights = dgl.softmax_nodes(g, 'score')
-        g.ndata['alpha'] = attention_weights
-        g.ndata['weighted_h'] = g.ndata['alpha'] * g.ndata['h']
+
+        # Weighted sum
+        g.ndata['weighted_h'] = attention_weights * projected_values
         graph_repr = dgl.sum_nodes(g, 'weighted_h')
 
+        # Layer norm
+        graph_repr = self.layer_norm(graph_repr)
+
+        if return_attention:
+            return graph_repr, attention_weights.detach()
         return graph_repr
 
+    def _multi_head_forward(self, g, node_features, node_query_concat, return_attention):
+        """Multi-head attention forward pass."""
+        head_outputs = []
+        attention_weights_list = []
 
-class MultiHeadQueryAttentionPooling(nn.Module):
-    """
-    Multi-head version of QueryAttentionPooling.
-    """
-    def __init__(self, emb_dim, num_heads=4, dropout=0.0, hidden_dim=None):
-        super().__init__()
-        self.emb_dim = emb_dim
-        self.num_heads = num_heads
+        for head_idx, (attention_head, value_proj) in enumerate(
+            zip(self.attention_heads, self.value_projections)
+        ):
+            # Project to head-specific value space
+            projected_values = value_proj(node_features)  # (N x head_dim)
 
-        if hidden_dim is None:
-            hidden_dim = emb_dim // 2
+            # Compute attention scores for this head
+            scores = attention_head(node_query_concat)  # (N x 1)
+            g.ndata[f'score_{head_idx}'] = scores
 
-        # Multiple query-conditioned attention heads
-        self.attention_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(3 * emb_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, 1)
-            )
-            for _ in range(num_heads)
-        ])
+            # Softmax per graph
+            attention_weights = dgl.softmax_nodes(g, f'score_{head_idx}')
 
-        self.combine_type = 'mean'
+            if return_attention:
+                attention_weights_list.append(attention_weights.detach())
 
-    def forward(self, g, node_features, head_ids, tail_ids):
+            # Weighted sum with projected values
+            g.ndata[f'weighted_h_{head_idx}'] = attention_weights * projected_values
+            head_repr = dgl.sum_nodes(g, f'weighted_h_{head_idx}')  # (batch x head_dim)
+            head_outputs.append(head_repr)
+
+        # Concatenate all heads
+        concat_repr = torch.cat(head_outputs, dim=-1)  # (batch x emb_dim)
+
+        # Output projection + layer norm
+        graph_repr = self.output_projection(concat_repr)
+        graph_repr = self.layer_norm(graph_repr)
+
+        if return_attention:
+            return graph_repr, attention_weights_list
+        return graph_repr
+
+    def get_attention_weights(self, g, node_features, head_ids, tail_ids):
         """
-        Args:
-            g: Batched DGL graph
-            node_features: Node features (N x emb_dim)
-            head_ids: Head entity indices
-            tail_ids: Tail entity indices
+        Convenience method to get attention weights for visualization/analysis.
 
         Returns:
-            Graph representations (batch_size x emb_dim)
+            attention_weights: Attention weights for each node
+            node_to_graph: Mapping from node index to graph index in batch
         """
+        _, attention_weights = self.forward(g, node_features, head_ids, tail_ids, return_attention=True)
+
+        # Create node-to-graph mapping for easier analysis
         batch_num_nodes = g.batch_num_nodes()
-        batch_size = len(batch_num_nodes)
-
-        # Extract query embeddings
-        head_embeds = node_features[head_ids]
-        tail_embeds = node_features[tail_ids]
-        query_embeds = torch.cat([head_embeds, tail_embeds], dim=1)
-
-        # Map nodes to graphs
-        graph_ids = torch.cat([
+        node_to_graph = torch.cat([
             torch.full((n,), i, dtype=torch.long, device=node_features.device)
             for i, n in enumerate(batch_num_nodes)
         ])
-        node_queries = query_embeds[graph_ids]
-        node_query_concat = torch.cat([node_features, node_queries], dim=1)
 
-        # Multi-head attention
-        head_outputs = []
-        for head_idx, attention_head in enumerate(self.attention_heads):
-            scores = attention_head(node_query_concat)
-            g.ndata[f'score_{head_idx}'] = scores
-            attention_weights = dgl.softmax_nodes(g, f'score_{head_idx}')
-            g.ndata[f'weighted_h_{head_idx}'] = attention_weights * node_features
-            head_repr = dgl.sum_nodes(g, f'weighted_h_{head_idx}')
-            head_outputs.append(head_repr)
-
-        # Combine heads
-        graph_repr = torch.mean(torch.stack(head_outputs, dim=0), dim=0)
-        return graph_repr
+        return attention_weights, node_to_graph

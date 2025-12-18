@@ -27,7 +27,14 @@ class GraphClassifier(nn.Module):
             self.gnn = RGCN(params)
             import logging
             logging.info("Using R-GCN backbone (original GraIL)")
-        self.rel_emb = nn.Embedding(self.params.num_rels, self.params.rel_emb_dim, sparse=False)
+        # Relation embedding (optional, for ablation study)
+        self.use_rel_emb = getattr(params, 'use_rel_emb', False)
+        if self.use_rel_emb:
+            self.rel_emb = nn.Embedding(self.params.num_rels, self.params.rel_emb_dim, sparse=False)
+            rel_emb_size = self.params.rel_emb_dim
+        else:
+            self.rel_emb = None
+            rel_emb_size = 0
 
         # Graph pooling module
         pool_type = getattr(params, 'pool_type', 'mean')
@@ -41,9 +48,9 @@ class GraphClassifier(nn.Module):
         )
 
         if self.params.add_ht_emb:
-            self.fc_layer = nn.Linear(3 * self.params.num_gcn_layers * self.params.emb_dim + self.params.rel_emb_dim, 1)
+            self.fc_layer = nn.Linear(3 * self.params.num_gcn_layers * self.params.emb_dim + rel_emb_size, 1)
         else:
-            self.fc_layer = nn.Linear(self.params.num_gcn_layers * self.params.emb_dim + self.params.rel_emb_dim, 1)
+            self.fc_layer = nn.Linear(self.params.num_gcn_layers * self.params.emb_dim + rel_emb_size, 1)
 
     def forward(self, data):
         g, rel_labels = data
@@ -66,12 +73,16 @@ class GraphClassifier(nn.Module):
         tail_embs = g.ndata['repr'][tail_ids]
 
         if self.params.add_ht_emb:
-            g_rep = torch.cat([g_out.view(-1, self.params.num_gcn_layers * self.params.emb_dim),
-                               head_embs.view(-1, self.params.num_gcn_layers * self.params.emb_dim),
-                               tail_embs.view(-1, self.params.num_gcn_layers * self.params.emb_dim),
-                               self.rel_emb(rel_labels)], dim=1)
+            components = [g_out.view(-1, self.params.num_gcn_layers * self.params.emb_dim),
+                          head_embs.view(-1, self.params.num_gcn_layers * self.params.emb_dim),
+                          tail_embs.view(-1, self.params.num_gcn_layers * self.params.emb_dim)]
         else:
-            g_rep = torch.cat([g_out.view(-1, self.params.num_gcn_layers * self.params.emb_dim), self.rel_emb(rel_labels)], dim=1)
+            components = [g_out.view(-1, self.params.num_gcn_layers * self.params.emb_dim)]
+
+        if self.use_rel_emb:
+            components.append(self.rel_emb(rel_labels))
+
+        g_rep = torch.cat(components, dim=1)
 
         output = self.fc_layer(g_rep)
         return output

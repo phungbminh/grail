@@ -3,6 +3,8 @@ import argparse
 import logging
 import json
 import time
+import lmdb
+import pickle
 
 import multiprocessing as mp
 import scipy.sparse as ssp
@@ -18,8 +20,156 @@ from subgraph_extraction.graph_sampler import (
     sample_neg,
     sample_fair_neg,
 )
-from utils.graph_utils import incidence_matrix, ssp_multigraph_to_dgl
+from utils.graph_utils import incidence_matrix, ssp_multigraph_to_dgl, deserialize
 from utils.data_utils import process_files as data_utils_process_files
+
+
+class LMDBRankingDataset:
+    """Dataset for ranking evaluation using pre-extracted subgraphs from LMDB."""
+
+    def __init__(self, db_path, split='valid', raw_data_paths=None, saved_relation2id=None,
+                 add_traspose_rels=False, num_neg_samples_per_link=1,
+                 use_kge_embeddings=False, dataset='', kge_model=''):
+        """
+        Args:
+            db_path: Path to LMDB database directory
+            split: 'valid' or 'test'
+            raw_data_paths: Dict with 'train' key for building adjacency list
+            saved_relation2id: Pre-defined relation2id mapping
+            add_traspose_rels: Whether to add transpose relations
+            num_neg_samples_per_link: Number of negative samples per positive link
+        """
+        self.db_path = db_path
+        self.split = split
+        self.num_neg_samples_per_link = num_neg_samples_per_link
+
+        # Open LMDB environment
+        self.main_env = lmdb.open(db_path, readonly=True, max_dbs=3, lock=False)
+        self.db_pos = self.main_env.open_db(f'{split}_pos'.encode())
+        self.db_neg = self.main_env.open_db(f'{split}_neg'.encode())
+
+        # Load KGE embeddings if needed
+        self.node_features, self.kge_entity2id = None, None
+        if use_kge_embeddings:
+            self.node_features, self.kge_entity2id = get_kge_embeddings(dataset, kge_model)
+
+        # Process raw data to get adjacency list and entity mappings
+        if raw_data_paths:
+            ssp_graph, _, _, _, self.id2entity, self.id2relation = data_utils_process_files(
+                raw_data_paths, saved_relation2id
+            )
+            self.num_rels = len(ssp_graph)
+
+            if add_traspose_rels:
+                ssp_graph_t = [adj.T for adj in ssp_graph]
+                ssp_graph += ssp_graph_t
+
+            self.aug_num_rels = len(ssp_graph)
+            self.graph = ssp_multigraph_to_dgl(ssp_graph)
+            self.ssp_graph = ssp_graph
+
+        # Read metadata
+        self.max_n_label = np.array([0, 0])
+        with self.main_env.begin() as txn:
+            self.max_n_label[0] = int.from_bytes(txn.get('max_n_label_sub'.encode()), byteorder='little')
+            self.max_n_label[1] = int.from_bytes(txn.get('max_n_label_obj'.encode()), byteorder='little')
+
+        # Get number of graphs
+        with self.main_env.begin(db=self.db_pos) as txn:
+            self.num_graphs_pos = int.from_bytes(txn.get('num_graphs'.encode()), byteorder='little')
+        with self.main_env.begin(db=self.db_neg) as txn:
+            self.num_graphs_neg = int.from_bytes(txn.get('num_graphs'.encode()), byteorder='little')
+
+        logging.info(f"LMDB Dataset loaded: {self.num_graphs_pos} positive, {self.num_graphs_neg} negative graphs")
+        logging.info(f"Max distance from sub: {self.max_n_label[0]}, Max distance from obj: {self.max_n_label[1]}")
+
+    def __len__(self):
+        return self.num_graphs_pos
+
+    def __getitem__(self, index):
+        """Get positive and negative subgraphs for ranking."""
+        # Load positive subgraph
+        with self.main_env.begin(db=self.db_pos) as txn:
+            str_id = '{:08}'.format(index).encode('ascii')
+            data_pos = deserialize(txn.get(str_id))
+            if data_pos is None:
+                return None
+            nodes_pos = data_pos['nodes']
+            r_label_pos = data_pos['r_label']
+            g_label_pos = data_pos['g_label']
+            n_labels_pos = data_pos['n_label']
+            subgraph_pos = self._prepare_subgraph(nodes_pos, r_label_pos, n_labels_pos)
+
+        # Load negative subgraphs
+        subgraphs_neg = []
+        r_labels_neg = []
+        with self.main_env.begin(db=self.db_neg) as txn:
+            for i in range(self.num_neg_samples_per_link):
+                neg_idx = index + i * self.num_graphs_pos
+                str_id = '{:08}'.format(neg_idx).encode('ascii')
+                data_neg = deserialize(txn.get(str_id))
+                if data_neg is None:
+                    continue
+                nodes_neg = data_neg['nodes']
+                r_label_neg = data_neg['r_label']
+                n_labels_neg = data_neg['n_label']
+                subgraphs_neg.append(self._prepare_subgraph(nodes_neg, r_label_neg, n_labels_neg))
+                r_labels_neg.append(r_label_neg)
+
+        return {
+            'pos': (subgraph_pos, r_label_pos, g_label_pos),
+            'neg': (subgraphs_neg, r_labels_neg)
+        }
+
+    def _prepare_subgraph(self, nodes, r_label, n_labels):
+        """Prepare DGL subgraph with features."""
+        subgraph = self.graph.subgraph(nodes)
+        subgraph.edata['type'] = self.graph.edata['type'][subgraph.edata[dgl.EID]]
+        subgraph.edata['label'] = torch.tensor(r_label * np.ones(subgraph.edata['type'].shape), dtype=torch.long)
+
+        # Add edge between roots if not exists
+        try:
+            edges_btw_roots = subgraph.edge_ids(0, 1)
+            rel_link = np.nonzero(subgraph.edata['type'][edges_btw_roots] == r_label)
+            if rel_link.squeeze().nelement() == 0:
+                subgraph = dgl.add_edges(subgraph, 0, 1, {
+                    'type': torch.tensor([r_label]).long(),
+                    'label': torch.tensor([r_label]).long()
+                })
+        except:
+            subgraph = dgl.add_edges(subgraph, 0, 1, {
+                'type': torch.tensor([r_label]).long(),
+                'label': torch.tensor([r_label]).long()
+            })
+
+        # Prepare node features
+        kge_nodes = [self.kge_entity2id[self.id2entity[n]] for n in nodes] if self.kge_entity2id else None
+        n_feats = self.node_features[kge_nodes] if self.node_features is not None else None
+        subgraph = self._prepare_features(subgraph, n_labels, n_feats)
+
+        return subgraph
+
+    def _prepare_features(self, subgraph, n_labels, n_feats=None):
+        """One-hot encode node labels and concatenate with features."""
+        n_nodes = subgraph.number_of_nodes()
+        label_feats = np.zeros((n_nodes, self.max_n_label[0] + 1 + self.max_n_label[1] + 1))
+        label_feats[np.arange(n_nodes), n_labels[:, 0]] = 1
+        label_feats[np.arange(n_nodes), self.max_n_label[0] + 1 + n_labels[:, 1]] = 1
+        n_feats = np.concatenate((label_feats, n_feats), axis=1) if n_feats is not None else label_feats
+        subgraph.ndata['feat'] = torch.FloatTensor(n_feats)
+
+        head_id = np.argwhere([label[0] == 0 and label[1] == 1 for label in n_labels])
+        tail_id = np.argwhere([label[0] == 1 and label[1] == 0 for label in n_labels])
+        n_ids = np.zeros(n_nodes)
+        n_ids[head_id] = 1  # head
+        n_ids[tail_id] = 2  # tail
+        subgraph.ndata['id'] = torch.FloatTensor(n_ids)
+
+        return subgraph
+
+    def close(self):
+        """Close LMDB environment."""
+        self.main_env.close()
 
 
 def process_files_ranking(files, saved_relation2id, add_traspose_rels):
@@ -681,6 +831,151 @@ def main(params):
     logger.info(f'MRR | Hits@1 | Hits@5 | Hits@10 : {mrr} | {hits_1} | {hits_5} | {hits_10}')
 
 
+def main_lmdb(params):
+    """
+    Main function for ranking evaluation using pre-extracted subgraphs from LMDB.
+    This is much faster as subgraphs are already computed.
+    """
+    # Step 1: Load model
+    logger.info("=" * 50)
+    logger.info("[Step 1/4] Loading model...")
+    start_time = time.time()
+
+    if params.device.type == 'cuda':
+        logger.info(f"Loading model to GPU: {params.device}")
+        model = torch.load(params.model_path, map_location=params.device)
+        model = model.to(params.device)
+    else:
+        logger.info("Loading model to CPU")
+        model = torch.load(params.model_path, map_location='cpu')
+
+    model.eval()
+    logger.info(f"[Step 1/4] Model loaded in {time.time() - start_time:.2f}s")
+
+    # Step 2: Load LMDB dataset
+    logger.info("=" * 50)
+    logger.info("[Step 2/4] Loading LMDB dataset...")
+    start_time = time.time()
+
+    raw_data_paths = {'train': params.file_paths['graph']}
+    dataset = LMDBRankingDataset(
+        db_path=params.lmdb_path,
+        split=params.lmdb_split,
+        raw_data_paths=raw_data_paths,
+        saved_relation2id=model.relation2id,
+        add_traspose_rels=params.add_traspose_rels,
+        num_neg_samples_per_link=params.num_neg_samples_per_link,
+        use_kge_embeddings=params.use_kge_embeddings,
+        dataset=params.dataset,
+        kge_model=params.kge_model
+    )
+
+    logger.info(f"[Step 2/4] LMDB dataset loaded in {time.time() - start_time:.2f}s")
+    logger.info(f"  - Positive samples: {dataset.num_graphs_pos:,}")
+    logger.info(f"  - Negative samples: {dataset.num_graphs_neg:,}")
+    logger.info(f"  - Neg per link: {params.num_neg_samples_per_link}")
+
+    # Step 3: Compute rankings
+    logger.info("=" * 50)
+    logger.info("[Step 3/4] Computing rankings...")
+    start_time = time.time()
+
+    ranks = []
+    all_scores = []
+    skipped = 0
+
+    num_samples = len(dataset)
+    batch_size = params.batch_size
+
+    for idx in tqdm(range(num_samples), desc="Computing ranks"):
+        data = dataset[idx]
+        if data is None:
+            skipped += 1
+            continue
+
+        pos_subgraph, r_label_pos, g_label_pos = data['pos']
+        neg_subgraphs, r_labels_neg = data['neg']
+
+        if len(neg_subgraphs) == 0:
+            skipped += 1
+            continue
+
+        # Combine positive and negative subgraphs
+        all_subgraphs = [pos_subgraph] + neg_subgraphs
+        all_r_labels = [r_label_pos] + r_labels_neg
+
+        # Batch inference
+        batched_graph = dgl.batch(all_subgraphs)
+        r_labels_tensor = torch.LongTensor(all_r_labels)
+
+        if params.device.type == 'cuda':
+            batched_graph = batched_graph.to(params.device)
+            r_labels_tensor = r_labels_tensor.to(params.device)
+
+        with torch.no_grad():
+            scores = model((batched_graph, r_labels_tensor)).squeeze(1).cpu().numpy()
+
+        # Positive is at index 0
+        pos_score = scores[0]
+        neg_scores = scores[1:]
+
+        # Compute rank (1-based)
+        rank = 1 + np.sum(neg_scores >= pos_score)
+        ranks.append(rank)
+        all_scores.append(scores.tolist())
+
+        # Log progress every 1000 samples
+        if (idx + 1) % 1000 == 0:
+            elapsed = time.time() - start_time
+            eta = elapsed / (idx + 1) * (num_samples - idx - 1)
+            current_mrr = np.mean(1 / np.array(ranks)) if ranks else 0
+            logger.info(f"  Progress: {idx+1}/{num_samples} | MRR: {current_mrr:.4f} | ETA: {eta:.1f}s")
+
+    logger.info(f"[Step 3/4] Rankings computed in {time.time() - start_time:.2f}s")
+    logger.info(f"  - Processed: {len(ranks):,}, Skipped: {skipped:,}")
+
+    # Step 4: Compute metrics
+    logger.info("=" * 50)
+    logger.info("[Step 4/4] Computing metrics...")
+
+    ranks_array = np.array(ranks)
+
+    hits_1 = np.mean(ranks_array <= 1)
+    hits_3 = np.mean(ranks_array <= 3)
+    hits_5 = np.mean(ranks_array <= 5)
+    hits_10 = np.mean(ranks_array <= 10)
+    mrr = np.mean(1 / ranks_array)
+
+    logger.info("=" * 50)
+    logger.info("FINAL RESULTS:")
+    logger.info(f"  MRR:      {mrr:.4f}")
+    logger.info(f"  Hits@1:   {hits_1:.4f}")
+    logger.info(f"  Hits@3:   {hits_3:.4f}")
+    logger.info(f"  Hits@5:   {hits_5:.4f}")
+    logger.info(f"  Hits@10:  {hits_10:.4f}")
+    logger.info("=" * 50)
+
+    # Save results
+    results = {
+        'mrr': float(mrr),
+        'hits@1': float(hits_1),
+        'hits@3': float(hits_3),
+        'hits@5': float(hits_5),
+        'hits@10': float(hits_10),
+        'num_samples': len(ranks),
+        'skipped': skipped
+    }
+
+    results_path = os.path.join('experiments', params.experiment_name, f'ranking_results_{params.lmdb_split}_{time.time()}.json')
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    logger.info(f"Results saved to {results_path}")
+
+    dataset.close()
+
+    return results
+
+
 if __name__ == '__main__':
 
     logging.basicConfig(level=logging.INFO)
@@ -692,8 +987,8 @@ if __name__ == '__main__':
                         help="Experiment name. Log file with this name will be created")
     parser.add_argument("--dataset", "-d", type=str, default="FB237_v2",
                         help="Path to dataset")
-    parser.add_argument("--mode", "-m", type=str, default="sample", choices=["sample", "all", "ruleN"],
-                        help="Negative sampling mode")
+    parser.add_argument("--mode", "-m", type=str, default="sample", choices=["sample", "all", "ruleN", "lmdb"],
+                        help="Negative sampling mode. Use 'lmdb' to use pre-extracted subgraphs from LMDB")
     parser.add_argument("--num_neg_samples", "-ns", type=int, default=50,
                         help="Number of negative samples per link (only for mode=sample)")
     parser.add_argument("--fair_sampling", "-fs", action='store_true',
@@ -742,6 +1037,14 @@ if __name__ == '__main__':
     parser.add_argument('--target_subgraph_size', '-tss', type=int, default=1000,
                         help='target subgraph size after pruning (M)')
 
+    # LMDB mode params
+    parser.add_argument('--lmdb_path', type=str, default=None,
+                        help='Path to LMDB database directory containing pre-extracted subgraphs (required for mode=lmdb)')
+    parser.add_argument('--lmdb_split', type=str, default='valid', choices=['train', 'valid', 'test'],
+                        help='Which split to use from LMDB (default: valid)')
+    parser.add_argument('--num_neg_samples_per_link', type=int, default=1,
+                        help='Number of negative samples per link in LMDB (default: 1)')
+
     params = parser.parse_args()
 
     params.file_paths = {
@@ -768,4 +1071,10 @@ if __name__ == '__main__':
                           in sorted(dict(vars(params)).items())))
     logger.info('============================================')
 
-    main(params)
+    # Run appropriate main function based on mode
+    if params.mode == 'lmdb':
+        if params.lmdb_path is None:
+            raise ValueError("--lmdb_path is required when mode=lmdb")
+        main_lmdb(params)
+    else:
+        main(params)

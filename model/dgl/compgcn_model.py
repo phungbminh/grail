@@ -200,6 +200,9 @@ class CompGCN(nn.Module):
         Returns:
             Node representations (num_nodes, num_layers, emb_dim)
         """
+        # Keep reference to original graph for storing results
+        original_g = g
+
         # Get edge types
         edge_type = g.edata['type']
 
@@ -214,24 +217,25 @@ class CompGCN(nn.Module):
                 torch.ones(g.num_edges(), device=self.device) * (1 - self.edge_dropout)
             ).bool()
 
-            # Create subgraph with remaining edges
+            # Create subgraph with remaining edges (use separate variable)
             edge_ids = torch.arange(g.num_edges(), device=self.device)[mask]
-            g = g.edge_subgraph(edge_ids, relabel_nodes=False)
+            g_dropout = g.edge_subgraph(edge_ids, relabel_nodes=False)
             edge_type = edge_type[mask]
+        else:
+            g_dropout = g
 
         # Forward through layers
         layer_outputs = []
 
         for i, layer in enumerate(self.layers):
             # CompGCNConv expects (graph, node_features, edge_type, edge_norm)
-            # edge_norm can be None for now
-            x = layer(g, x, edge_type, edge_norm=None)
-
+            x = layer(g_dropout, x, edge_type, edge_norm=None)
             layer_outputs.append(x)
 
         # Stack layer outputs: (num_nodes, num_layers, emb_dim)
         # Store both stacked (repr) and flattened (h) versions like R-GCN
-        g.ndata['repr'] = torch.stack(layer_outputs, dim=1)
-        g.ndata['h'] = torch.cat(layer_outputs, dim=1)
+        # IMPORTANT: Store in original graph, not dropout subgraph
+        original_g.ndata['repr'] = torch.stack(layer_outputs, dim=1)
+        original_g.ndata['h'] = torch.cat(layer_outputs, dim=1)
 
-        return g.ndata.pop('h')
+        return original_g.ndata.pop('h')

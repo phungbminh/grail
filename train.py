@@ -207,6 +207,8 @@ if __name__ == '__main__':
                         help='number of attention heads for attention pooling (default: 1, recommended: 4 for multi-head)')
     parser.add_argument('--pool_dropout', '-pd', type=float, default=0.0,
                         help='dropout rate for attention pooling (default: 0.0, recommended: 0.1-0.2 for attention)')
+    parser.add_argument('--use_rel_emb', action='store_true',
+                        help='use relation embedding in final classifier (for ablation study)')
 
     # Semantic pruning params
     parser.add_argument('--use_semantic_pruning', '-sp', action='store_true',

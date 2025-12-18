@@ -31,7 +31,8 @@ class Evaluator():
         # Training can still use num_workers > 0, but eval must be single-threaded with LMDB
         eval_workers = 0  # FORCE 0 to prevent RuntimeError with multiprocessing + LMDB
 
-        dataloader = DataLoader(self.data, batch_size=self.params.batch_size, shuffle=False,
+        eval_batch_size = self.params.batch_size * 3  # Eval can use larger batch (no gradients)
+        dataloader = DataLoader(self.data, batch_size=eval_batch_size, shuffle=False,
                                num_workers=eval_workers, collate_fn=self.params.collate_fn)
 
         self.graph_classifier.eval()

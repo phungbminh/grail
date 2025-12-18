@@ -96,8 +96,9 @@ class Trainer():
                 all_labels += targets_pos.tolist() + targets_neg.tolist()
                 total_loss += loss.item()
 
-            # Update progress bar with current loss
-            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'batch': b_idx})
+            # Update progress bar with average loss (smoother than batch loss)
+            avg_loss = total_loss / (b_idx + 1)
+            pbar.set_postfix({'loss': f'{avg_loss:.4f}', 'batch': b_idx})
 
             # TensorBoard: Log batch loss every 100 iterations
             if self.updates_counter % 100 == 0:
@@ -177,6 +178,15 @@ class Trainer():
 
             if epoch % self.params.save_every == 0:
                 torch.save(self.graph_classifier, os.path.join(self.params.exp_dir, 'graph_classifier_chk.pth'))
+
+        # Final evaluation after last epoch
+        if self.valid_evaluator:
+            logging.info('Final evaluation after training...')
+            result = self.valid_evaluator.eval()
+            logging.info(f'Final validation result: {result}')
+            if result['auc'] >= self.best_metric:
+                self.save_classifier()
+                self.best_metric = result['auc']
 
     def save_classifier(self):
         torch.save(self.graph_classifier, os.path.join(self.params.exp_dir, 'best_graph_classifier.pth'))  # Does it overwrite or fuck with the existing file?

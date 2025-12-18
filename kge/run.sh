@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 python -u -c 'import torch; print(torch.__version__)'
 
@@ -26,7 +26,7 @@ LEARNING_RATE=${11}
 MAX_STEPS=${12}
 TEST_BATCH_SIZE=${13}
 
-if [ $MODE == "train" ]
+if [ "$MODE" == "train" ]
 then
 
 echo "Start Training......"
@@ -43,14 +43,14 @@ CUDA_VISIBLE_DEVICES=$GPU_DEVICE python -u $CODE_PATH/run.py --do_train \
     -save $SAVE --test_batch_size $TEST_BATCH_SIZE \
     ${14} ${15} ${16} ${17} ${18} ${19} ${20}
 
-elif [ $MODE == "valid" ]
+elif [ "$MODE" == "valid" ]
 then
 
 echo "Start Evaluation on Valid Data Set......"
 
 CUDA_VISIBLE_DEVICES=$GPU_DEVICE python -u $CODE_PATH/run.py --do_valid --cuda -init $SAVE
 
-elif [ $MODE == "test" ]
+elif [ "$MODE" == "test" ]
 then
 
 echo "Start Evaluation on Test Data Set......"

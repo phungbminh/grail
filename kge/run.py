@@ -20,8 +20,9 @@ from torch.utils.data import DataLoader
 
 from kge.model import KGEModel
 
-from kge.dataloader import TrainDataset
+from kge.dataloader import TrainDataset, TestDataset
 from kge.dataloader import BidirectionalOneShotIterator
+from kge.dataloader import load_entity_dict
 
 
 def parse_args(args=None):
@@ -53,7 +54,7 @@ def parse_args(args=None):
     parser.add_argument('-a', '--adversarial_temperature', default=1.0, type=float)
     parser.add_argument('-b', '--batch_size', default=1024, type=int)
     parser.add_argument('-r', '--regularization', default=0.0, type=float)
-    parser.add_argument('--test_batch_size', default=4, type=int, help='valid/test batch size')
+    parser.add_argument('--test_batch_size', default=128, type=int, help='valid/test batch size')
     parser.add_argument('--uni_weight', action='store_true',
                         help='Otherwise use subsampling weighting like in word2vec')
 
@@ -71,6 +72,9 @@ def parse_args(args=None):
 
     parser.add_argument('--nentity', type=int, default=0, help='DO NOT MANUALLY SET')
     parser.add_argument('--nrelation', type=int, default=0, help='DO NOT MANUALLY SET')
+
+    parser.add_argument('--type_constrained', action='store_true',
+                        help='Use type-constrained negative sampling (OGB standard)')
 
     return parser.parse_args(args)
 
@@ -212,6 +216,21 @@ def main(args):
     args.nentity = nentity
     args.nrelation = nrelation
 
+    # Load entity_dict for type-constrained sampling (OGB standard)
+    entity_to_type, type_to_entities = None, None
+    if args.type_constrained:
+        entity_to_type, type_to_entities = load_entity_dict(args.data_path)
+        if entity_to_type is None:
+            logging.warning('entity_dict.json not found. Falling back to uniform sampling.')
+            args.type_constrained = False
+        else:
+            logging.info('Type-constrained sampling enabled (OGB standard)')
+            logging.info(f'Entity types: {list(type_to_entities.keys())}')
+
+    # Store in args for test_step access
+    args.entity_to_type = entity_to_type
+    args.type_to_entities = type_to_entities
+
     logging.info('Model: %s' % args.model)
     logging.info('Data Path: %s' % args.data_path)
     logging.info('#entity: %d' % nentity)
@@ -254,7 +273,8 @@ def main(args):
     if args.do_train:
         # Set training dataloader iterator
         train_dataloader_head = DataLoader(
-            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'head-batch'),
+            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'head-batch',
+                         entity_to_type=entity_to_type, type_to_entities=type_to_entities),
             batch_size=args.batch_size,
             shuffle=True,
             num_workers=max(1, args.cpu_num // 2),
@@ -262,7 +282,8 @@ def main(args):
         )
 
         train_dataloader_tail = DataLoader(
-            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'tail-batch'),
+            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'tail-batch',
+                         entity_to_type=entity_to_type, type_to_entities=type_to_entities),
             batch_size=args.batch_size,
             shuffle=True,
             num_workers=max(1, args.cpu_num // 2),
