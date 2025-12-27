@@ -13,9 +13,9 @@ echo "Start time: $(date)"
 echo ""
 
 # Create results directory
-RESULTS_DIR="fair_comparison_results"
+RESULTS_DIR="fair_comparison_results_v2"
 mkdir -p $RESULTS_DIR
-SUMMARY_FILE="$RESULTS_DIR/summary.txt"
+SUMMARY_FILE="$RESULTS_DIR/summary_v2.txt"
 
 # Clear previous summary
 > $SUMMARY_FILE
@@ -51,7 +51,7 @@ echo "Model,MRR,MR,Hits@1,Hits@3,Hits@10" > $SUMMARY_FILE
 echo "=============================================="
 echo "[1/5] Training TransE..."
 echo "=============================================="
-./run.sh train TransE ogbl-biokg 0 transe_fair 1024 256 64 9.0 1.0 0.0001 100000 64 2>&1 | tee $RESULTS_DIR/transe.log
+./run.sh train TransE ogbl-biokg-full 0 transe_fair 1024 256 64 9.0 1.0 0.0001 100000 64 2>&1 | tee $RESULTS_DIR/transe.log
 extract_metrics "TransE" "$RESULTS_DIR/transe.log"
 echo ""
 
@@ -59,7 +59,7 @@ echo ""
 echo "=============================================="
 echo "[2/5] Training DistMult..."
 echo "=============================================="
-./run.sh train DistMult ogbl-biokg 0 distmult_fair 1024 256 64 200.0 1.0 0.0001 100000 64 2>&1 | tee $RESULTS_DIR/distmult.log
+./run.sh train DistMult ogbl-biokg-full 0 distmult_fair 1024 256 64 200.0 1.0 0.0001 100000 64 2>&1 | tee $RESULTS_DIR/distmult.log
 extract_metrics "DistMult" "$RESULTS_DIR/distmult.log"
 echo ""
 
@@ -67,7 +67,7 @@ echo ""
 echo "=============================================="
 echo "[3/5] Training ComplEx..."
 echo "=============================================="
-./run.sh train ComplEx ogbl-biokg 0 complex_fair 1024 256 64 200.0 1.0 0.0001 100000 64 --double_entity_embedding --double_relation_embedding 2>&1 | tee $RESULTS_DIR/complex.log
+./run.sh train ComplEx ogbl-biokg-full 0 complex_fair 1024 256 64 200.0 1.0 0.0001 100000 64 --double_entity_embedding --double_relation_embedding 2>&1 | tee $RESULTS_DIR/complex.log
 extract_metrics "ComplEx" "$RESULTS_DIR/complex.log"
 echo ""
 
@@ -75,7 +75,7 @@ echo ""
 echo "=============================================="
 echo "[4/5] Training RotatE..."
 echo "=============================================="
-./run.sh train RotatE ogbl-biokg 0 rotate_fair 1024 256 64 9.0 1.0 0.0001 100000 64 --double_entity_embedding 2>&1 | tee $RESULTS_DIR/rotate.log
+./run.sh train RotatE ogbl-biokg-full 0 rotate_fair 1024 256 64 9.0 1.0 0.0001 100000 64 --double_entity_embedding 2>&1 | tee $RESULTS_DIR/rotate.log
 extract_metrics "RotatE" "$RESULTS_DIR/rotate.log"
 echo ""
 
@@ -83,7 +83,7 @@ echo ""
 echo "=============================================="
 echo "[5/5] Training pRotatE..."
 echo "=============================================="
-./run.sh train pRotatE ogbl-biokg 0 protate_fair 1024 256 64 9.0 1.0 0.0001 100000 64 2>&1 | tee $RESULTS_DIR/protate.log
+./run.sh train pRotatE ogbl-biokg-full 0 protate_fair 1024 256 64 9.0 1.0 0.0001 100000 64 2>&1 | tee $RESULTS_DIR/protate.log
 extract_metrics "pRotatE" "$RESULTS_DIR/protate.log"
 echo ""
 
