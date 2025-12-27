@@ -139,6 +139,11 @@ def collate_dgl(samples):
     Old: ~1300ms for batch=16 (dgl.batch is slow)
     New: ~400-600ms (2-3x faster)
     """
+    # Filter out None samples (from missing LMDB entries)
+    samples = [s for s in samples if s is not None]
+    if len(samples) == 0:
+        return None
+
     # Pre-allocate lists with known sizes for better performance
     batch_size = len(samples)
 

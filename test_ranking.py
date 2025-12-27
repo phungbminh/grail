@@ -68,17 +68,36 @@ class LMDBRankingDataset:
             self.graph = ssp_multigraph_to_dgl(ssp_graph)
             self.ssp_graph = ssp_graph
 
-        # Read metadata
+        # Read metadata (with fallback for incomplete LMDB)
         self.max_n_label = np.array([0, 0])
         with self.main_env.begin() as txn:
-            self.max_n_label[0] = int.from_bytes(txn.get('max_n_label_sub'.encode()), byteorder='little')
-            self.max_n_label[1] = int.from_bytes(txn.get('max_n_label_obj'.encode()), byteorder='little')
+            max_label_sub = txn.get('max_n_label_sub'.encode())
+            max_label_obj = txn.get('max_n_label_obj'.encode())
 
-        # Get number of graphs
-        with self.main_env.begin(db=self.db_pos) as txn:
-            self.num_graphs_pos = int.from_bytes(txn.get('num_graphs'.encode()), byteorder='little')
-        with self.main_env.begin(db=self.db_neg) as txn:
-            self.num_graphs_neg = int.from_bytes(txn.get('num_graphs'.encode()), byteorder='little')
+            if max_label_sub is not None and max_label_obj is not None:
+                self.max_n_label[0] = int.from_bytes(max_label_sub, byteorder='little')
+                self.max_n_label[1] = int.from_bytes(max_label_obj, byteorder='little')
+            else:
+                # Fallback: use default values (hop=2 means max label = 2)
+                logging.warning("LMDB metadata missing, using default max_n_label=[2, 2]")
+                self.max_n_label = np.array([2, 2])
+
+        # Get number of graphs (with error handling)
+        try:
+            with self.main_env.begin(db=self.db_pos) as txn:
+                num_graphs_bytes = txn.get('num_graphs'.encode())
+                if num_graphs_bytes is None:
+                    raise ValueError(f"LMDB {split}_pos has no 'num_graphs' key - generation may be incomplete")
+                self.num_graphs_pos = int.from_bytes(num_graphs_bytes, byteorder='little')
+            with self.main_env.begin(db=self.db_neg) as txn:
+                num_graphs_bytes = txn.get('num_graphs'.encode())
+                if num_graphs_bytes is None:
+                    raise ValueError(f"LMDB {split}_neg has no 'num_graphs' key - generation may be incomplete")
+                self.num_graphs_neg = int.from_bytes(num_graphs_bytes, byteorder='little')
+        except Exception as e:
+            logging.error(f"Failed to read LMDB: {e}")
+            logging.error("Please ensure the LMDB generation completed successfully")
+            raise
 
         logging.info(f"LMDB Dataset loaded: {self.num_graphs_pos} positive, {self.num_graphs_neg} negative graphs")
         logging.info(f"Max distance from sub: {self.max_n_label[0]}, Max distance from obj: {self.max_n_label[1]}")
@@ -885,51 +904,83 @@ def main_lmdb(params):
     skipped = 0
 
     num_samples = len(dataset)
-    batch_size = params.batch_size
+    batch_size = params.batch_size  # Number of test samples to process together
+    num_neg = params.num_neg_samples_per_link
 
-    for idx in tqdm(range(num_samples), desc="Computing ranks"):
-        data = dataset[idx]
-        if data is None:
-            skipped += 1
+    # Process multiple test samples in batches for better GPU utilization
+    num_batches = (num_samples + batch_size - 1) // batch_size
+
+    for batch_idx in tqdm(range(num_batches), desc="Computing ranks (batched)"):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, num_samples)
+
+        # Collect all subgraphs for this batch
+        batch_subgraphs = []
+        batch_r_labels = []
+        batch_sample_sizes = []  # Track how many subgraphs per sample
+
+        for idx in range(batch_start, batch_end):
+            data = dataset[idx]
+            if data is None:
+                skipped += 1
+                batch_sample_sizes.append(0)
+                continue
+
+            pos_subgraph, r_label_pos, g_label_pos = data['pos']
+            neg_subgraphs, r_labels_neg = data['neg']
+
+            if len(neg_subgraphs) == 0:
+                skipped += 1
+                batch_sample_sizes.append(0)
+                continue
+
+            # Add positive and negatives
+            all_subgraphs = [pos_subgraph] + neg_subgraphs
+            all_r_labels = [r_label_pos] + r_labels_neg
+
+            batch_subgraphs.extend(all_subgraphs)
+            batch_r_labels.extend(all_r_labels)
+            batch_sample_sizes.append(len(all_subgraphs))
+
+        if len(batch_subgraphs) == 0:
             continue
 
-        pos_subgraph, r_label_pos, g_label_pos = data['pos']
-        neg_subgraphs, r_labels_neg = data['neg']
-
-        if len(neg_subgraphs) == 0:
-            skipped += 1
-            continue
-
-        # Combine positive and negative subgraphs
-        all_subgraphs = [pos_subgraph] + neg_subgraphs
-        all_r_labels = [r_label_pos] + r_labels_neg
-
-        # Batch inference
-        batched_graph = dgl.batch(all_subgraphs)
-        r_labels_tensor = torch.LongTensor(all_r_labels)
+        # Batch inference for all subgraphs in this batch
+        batched_graph = dgl.batch(batch_subgraphs)
+        r_labels_tensor = torch.LongTensor(batch_r_labels)
 
         if params.device.type == 'cuda':
             batched_graph = batched_graph.to(params.device)
             r_labels_tensor = r_labels_tensor.to(params.device)
 
         with torch.no_grad():
-            scores = model((batched_graph, r_labels_tensor)).squeeze(1).cpu().numpy()
+            all_batch_scores = model((batched_graph, r_labels_tensor)).squeeze(1).cpu().numpy()
 
-        # Positive is at index 0
-        pos_score = scores[0]
-        neg_scores = scores[1:]
+        # Split scores back to individual samples and compute ranks
+        score_offset = 0
+        for sample_size in batch_sample_sizes:
+            if sample_size == 0:
+                continue
 
-        # Compute rank (1-based)
-        rank = 1 + np.sum(neg_scores >= pos_score)
-        ranks.append(rank)
-        all_scores.append(scores.tolist())
+            scores = all_batch_scores[score_offset:score_offset + sample_size]
+            score_offset += sample_size
 
-        # Log progress every 1000 samples
-        if (idx + 1) % 1000 == 0:
+            # Positive is at index 0
+            pos_score = scores[0]
+            neg_scores = scores[1:]
+
+            # Compute rank (1-based)
+            rank = 1 + np.sum(neg_scores >= pos_score)
+            ranks.append(rank)
+            all_scores.append(scores.tolist())
+
+        # Log progress
+        processed = len(ranks)
+        if processed > 0 and (batch_idx + 1) % 10 == 0:
             elapsed = time.time() - start_time
-            eta = elapsed / (idx + 1) * (num_samples - idx - 1)
-            current_mrr = np.mean(1 / np.array(ranks)) if ranks else 0
-            logger.info(f"  Progress: {idx+1}/{num_samples} | MRR: {current_mrr:.4f} | ETA: {eta:.1f}s")
+            eta = elapsed / processed * (num_samples - processed - skipped)
+            current_mrr = np.mean(1 / np.array(ranks))
+            logger.info(f"  Progress: {processed}/{num_samples} | MRR: {current_mrr:.4f} | ETA: {eta:.1f}s")
 
     logger.info(f"[Step 3/4] Rankings computed in {time.time() - start_time:.2f}s")
     logger.info(f"  - Processed: {len(ranks):,}, Skipped: {skipped:,}")

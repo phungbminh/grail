@@ -11,9 +11,9 @@ echo "Start time: $(date)"
 echo ""
 
 # Base parameters
-DB_PATH="data/ogbl-biokg/100_tssp_hop2"
-DATASET="ogbl-biokg"
-BATCH_SIZE=32
+DB_PATH="data/ogbl-biokg-full/200_hop2_new"
+DATASET="ogbl-biokg-full"
+BATCH_SIZE=42
 NUM_WORKERS=12
 EMB_DIM=64
 HOP=2
@@ -73,7 +73,7 @@ mkdir -p $RESULTS_DIR
 # echo "[1/6] Query attention 4 heads, WITH rel_emb"
 # echo "=============================================="
 # python train.py \
-#   --experiment_name ablation_v2_query_4h_rel \
+#   --experiment_name ablation_v3_query_4h_rel \
 #   $COMMON_ARGS \
 #   --pool_type query_attention \
 #   --pool_heads 4 \
@@ -88,12 +88,12 @@ echo "=============================================="
 echo "[2/6] Query attention 4 heads, NO rel_emb"
 echo "=============================================="
 python train.py \
-  --experiment_name ablation_v2_query_4h_no_rel \
+  --experiment_name ablation_v3_query_4h_no_rel \
   $COMMON_ARGS \
   --pool_type query_attention \
   --pool_heads 4 \
   --pool_dropout 0.1 \
-  2>&1 | tee $RESULTS_DIR/2_query_4h_no_rel.log
+  2>&1 | tee $RESULTS_DIR/ablation_v3_query_4h_no_rel.log
 
 # ============================================
 # Case 3: Query attention 1 head, with rel_emb
@@ -102,13 +102,13 @@ echo "=============================================="
 echo "[3/6] Query attention 1 head, WITH rel_emb"
 echo "=============================================="
 python train.py \
-  --experiment_name ablation_v2_query_1h_rel \
+  --experiment_name ablation_v3_query_1h_rel \
   $COMMON_ARGS \
   --pool_type query_attention \
   --pool_heads 1 \
   --pool_dropout 0.1 \
   --use_rel_emb \
-  2>&1 | tee $RESULTS_DIR/3_query_1h_rel.log
+  2>&1 | tee $RESULTS_DIR/ablation_v3_query_1h_rel.log
 
 # ============================================
 # Case 4: Query attention 1 head, no rel_emb
@@ -117,12 +117,12 @@ echo "=============================================="
 echo "[4/6] Query attention 1 head, NO rel_emb"
 echo "=============================================="
 python train.py \
-  --experiment_name ablation_v2_query_1h_no_rel \
+  --experiment_name ablation_v3_query_1h_no_rel \
   $COMMON_ARGS \
   --pool_type query_attention \
   --pool_heads 1 \
   --pool_dropout 0.1 \
-  2>&1 | tee $RESULTS_DIR/4_query_1h_no_rel.log
+  2>&1 | tee $RESULTS_DIR/ablation_v3_query_1h_no_rel.log
 
 # ============================================
 # Case 5: Mean pooling, with rel_emb
@@ -131,11 +131,11 @@ echo "=============================================="
 echo "[5/6] Mean pooling, WITH rel_emb"
 echo "=============================================="
 python train.py \
-  --experiment_name ablation_v2_mean_rel \
+  --experiment_name ablation_v3_mean_rel \
   $COMMON_ARGS \
   --pool_type mean \
   --use_rel_emb \
-  2>&1 | tee $RESULTS_DIR/5_mean_rel.log
+  2>&1 | tee $RESULTS_DIR/ablation_v3_mean_rel.log
 
 # ============================================
 # Case 6: Mean pooling, no rel_emb (baseline)
@@ -144,10 +144,10 @@ echo "=============================================="
 echo "[6/6] Mean pooling, NO rel_emb (baseline)"
 echo "=============================================="
 python train.py \
-  --experiment_name ablation_v2_mean_no_rel \
+  --experiment_name ablation_v3_mean_no_rel \
   $COMMON_ARGS \
   --pool_type mean \
-  2>&1 | tee $RESULTS_DIR/6_mean_no_rel.log
+  2>&1 | tee $RESULTS_DIR/ablation_v3_mean_no_rel.log
 
 # ============================================
 # Summary
@@ -169,4 +169,4 @@ echo ""
 echo "Logs saved to: $RESULTS_DIR/"
 echo ""
 echo "To evaluate, run test_ranking.py for each experiment:"
-echo "  python test_ranking.py --experiment_name ablation_v2_mean_no_rel ..."
+echo "  python test_ranking.py --experiment_name ablation_v3_mean_no_rel ..."

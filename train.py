@@ -142,6 +142,8 @@ if __name__ == '__main__':
                         help="Regularization constant for GNN weights")
     parser.add_argument("--margin", type=float, default=10,
                         help="The margin between positive and negative samples in the max-margin loss")
+    parser.add_argument("--loss_type", type=str, default="margin", choices=['margin', 'bce'],
+                        help="Loss function type: 'margin' (MarginRankingLoss) or 'bce' (BCEWithLogitsLoss)")
 
     # Data processing pipeline params
     parser.add_argument("--db_path", type=str, default=None,

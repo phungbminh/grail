@@ -29,6 +29,133 @@ from utils.graph_utils import incidence_matrix, remove_nodes, ssp_to_torch, seri
 import networkx as nx
 
 
+def sample_mixed_neg(adj_list, edges, data_dir, num_neg_samples_per_link=1, max_size=1000000,
+                     hard_negative_ratio=0.5, constrained_neg_prob=0):
+    """
+    Sample negative edges with MIXED strategy:
+    - hard_negative_ratio (0-1): Fraction of negatives that are HARD (same entity type)
+    - Remaining are RANDOM negatives
+
+    This is the RECOMMENDED approach for improving MRR while avoiding overfitting.
+
+    Args:
+        adj_list: List of adjacency matrices per relation
+        edges: Positive edges array (head, tail, rel)
+        data_dir: Directory containing entity_to_type.json
+        num_neg_samples_per_link: Number of negatives per positive
+        max_size: Maximum number of positive edges to sample
+        hard_negative_ratio: Fraction of hard negatives (default 0.5 = 50%)
+        constrained_neg_prob: Probability of constrained sampling (legacy)
+
+    Returns:
+        pos_edges, neg_edges
+    """
+    # Load entity type mapping
+    entity_to_type = load_entity_to_type(data_dir)
+
+    if entity_to_type is None:
+        logging.warning("No entity_to_type.json found, using random sampling only")
+        return sample_neg(adj_list, edges, num_neg_samples_per_link, max_size, constrained_neg_prob)
+
+    pos_edges = edges
+    neg_edges = []
+
+    # If max_size is set, randomly sample train links
+    if max_size < len(pos_edges):
+        perm = np.random.permutation(len(pos_edges))[:max_size]
+        pos_edges = pos_edges[perm]
+
+    n, r = adj_list[0].shape[0], len(adj_list)
+
+    # Build type_to_entities mapping for fast sampling
+    type_to_entities = {}
+    for ent_id, ent_type in entity_to_type.items():
+        if ent_type not in type_to_entities:
+            type_to_entities[ent_type] = []
+        type_to_entities[ent_type].append(ent_id)
+
+    # Convert to numpy arrays for fast sampling
+    for ent_type in type_to_entities:
+        type_to_entities[ent_type] = np.array(type_to_entities[ent_type])
+
+    logging.info(f"Mixed negative sampling: {hard_negative_ratio*100:.0f}% hard, {(1-hard_negative_ratio)*100:.0f}% random")
+    logging.info(f"Entity types: {', '.join(f'{t}:{len(e)}' for t, e in type_to_entities.items())}")
+
+    target_neg_samples = num_neg_samples_per_link * len(pos_edges)
+    num_hard = int(target_neg_samples * hard_negative_ratio)
+    num_random = target_neg_samples - num_hard
+
+    logging.info(f"Target: {num_hard:,} hard + {num_random:,} random = {target_neg_samples:,} negatives")
+
+    pbar = tqdm(total=target_neg_samples, desc="Mixed negative sampling", ncols=100)
+
+    hard_count = 0
+    random_count = 0
+    sample_idx = 0
+
+    while len(neg_edges) < target_neg_samples:
+        head, tail, rel = pos_edges[sample_idx % len(pos_edges)]
+
+        # Decide: hard or random negative
+        use_hard = (hard_count < num_hard) and (random_count >= num_random or np.random.random() < hard_negative_ratio)
+
+        neg_head, neg_tail = head, tail
+
+        if use_hard:
+            # HARD NEGATIVE: Sample from same entity type
+            tail_type = entity_to_type.get(tail, None)
+            head_type = entity_to_type.get(head, None)
+
+            if np.random.uniform() < 0.5 and tail_type is not None:
+                # Corrupt tail with same type
+                candidates = type_to_entities.get(tail_type, np.array([]))
+                if len(candidates) > 1:
+                    neg_tail = np.random.choice(candidates)
+                    while neg_tail == tail and len(candidates) > 1:
+                        neg_tail = np.random.choice(candidates)
+                else:
+                    neg_tail = np.random.randint(0, n)
+            elif head_type is not None:
+                # Corrupt head with same type
+                candidates = type_to_entities.get(head_type, np.array([]))
+                if len(candidates) > 1:
+                    neg_head = np.random.choice(candidates)
+                    while neg_head == head and len(candidates) > 1:
+                        neg_head = np.random.choice(candidates)
+                else:
+                    neg_head = np.random.randint(0, n)
+            else:
+                # Fallback to random
+                if np.random.uniform() < 0.5:
+                    neg_head = np.random.randint(0, n)
+                else:
+                    neg_tail = np.random.randint(0, n)
+        else:
+            # RANDOM NEGATIVE: Sample from any entity
+            if np.random.uniform() < 0.5:
+                neg_head = np.random.randint(0, n)
+            else:
+                neg_tail = np.random.randint(0, n)
+
+        # Check validity
+        if neg_head != neg_tail and adj_list[rel][neg_head, neg_tail] == 0:
+            neg_edges.append([neg_head, neg_tail, rel])
+            if use_hard:
+                hard_count += 1
+            else:
+                random_count += 1
+            pbar.update(1)
+
+        sample_idx += 1
+
+    pbar.close()
+
+    logging.info(f"Generated {len(neg_edges):,} negatives ({hard_count:,} hard, {random_count:,} random)")
+
+    neg_edges = np.array(neg_edges)
+    return pos_edges, neg_edges
+
+
 def sample_neg(adj_list, edges, num_neg_samples_per_link=1, max_size=1000000, constrained_neg_prob=0):
     pos_edges = edges
     neg_edges = []
@@ -97,15 +224,38 @@ def load_entity_dict(data_dir):
         return None
 
 
+def load_entity_to_type(data_dir):
+    """
+    Load direct entity_id -> type mapping from entity_to_type.json.
+    This is needed when entities are NOT stored contiguously by type.
+    """
+    entity_to_type_file = os.path.join(data_dir, 'entity_to_type.json')
+
+    if not os.path.exists(entity_to_type_file):
+        return None
+
+    try:
+        with open(entity_to_type_file, 'r') as f:
+            entity_to_type = json.load(f)
+        # Convert string keys to int
+        entity_to_type = {int(k): v for k, v in entity_to_type.items()}
+        logging.info(f"Loaded direct entity-to-type mapping for {len(entity_to_type)} entities")
+        return entity_to_type
+    except Exception as e:
+        logging.error(f"Error loading entity_to_type: {e}")
+        return None
+
+
 def sample_fair_neg(adj_list, edges, data_dir, num_neg_samples_per_link=1, max_size=1000000, constrained_neg_prob=0):
     """
     Sample negative edges with entity type constraints (fair corruption).
     Only corrupt entities with entities of the SAME TYPE - OGB standard!
     """
-    # Load entity type mapping
+    # Try loading direct entity_to_type mapping first (for non-contiguous entity storage)
+    entity_to_type = load_entity_to_type(data_dir)
     entity_dict = load_entity_dict(data_dir)
 
-    if entity_dict is None:
+    if entity_to_type is None and entity_dict is None:
         # Fallback to original uniform sampling
         logging.warning("No entity type mapping available, using uniform sampling")
         return sample_neg(adj_list, edges, num_neg_samples_per_link, max_size, constrained_neg_prob)
@@ -132,23 +282,28 @@ def sample_fair_neg(adj_list, edges, data_dir, num_neg_samples_per_link=1, max_s
     valid_heads = [adj.tocoo().row.tolist() for adj in adj_list]
     valid_tails = [adj.tocoo().col.tolist() for adj in adj_list]
 
-    # Create entity to type mapping from entity_dict
-    # Use dict comprehension for 10-100x speedup vs loop
-    logging.info(f"Building entity type mapping from {len(entity_dict)} entity types...")
+    # Build entity_to_type mapping
+    if entity_to_type is None:
+        # Fall back to computing from entity_dict (for contiguous entity storage)
+        logging.info(f"Building entity type mapping from entity_dict ({len(entity_dict)} types)...")
+        entity_to_type = {
+            entity_id: entity_type
+            for entity_type, (count, offset) in entity_dict.items()
+            for entity_id in range(offset, offset + count)
+        }
+    else:
+        logging.info(f"Using direct entity-to-type mapping ({len(entity_to_type)} entities)")
 
-    entity_to_type = {
-        entity_id: entity_type
-        for entity_type, range_tuple in entity_dict.items()
-        for entity_id in range(range_tuple[0], range_tuple[1])
-    }
+    logging.info(f"Fair negative sampling: {len(entity_to_type):,} entities mapped to types")
 
-    logging.info(f"Fair negative sampling: using entity type mapping for {len(entity_dict)} types, {len(entity_to_type):,} entities")
-
-    # OPTIMIZATION: Pre-compute entity pools for ultra-fast sampling
+    # Build entity pools from entity_to_type (works for both contiguous and non-contiguous)
     entity_pools = {}
-    for entity_type, range_tuple in entity_dict.items():
-        start, end = range_tuple[0], range_tuple[1]
-        entity_pools[entity_type] = list(range(start, end))
+    for entity_id, entity_type in entity_to_type.items():
+        if entity_type not in entity_pools:
+            entity_pools[entity_type] = []
+        entity_pools[entity_type].append(entity_id)
+
+    logging.info(f"Entity pools: {', '.join(f'{t}:{len(p)}' for t, p in entity_pools.items())}")
 
     # OPTIMIZATION: Use 8-core multiprocessing for large datasets
     target_neg_samples = num_neg_samples_per_link * len(pos_edges)
@@ -452,8 +607,9 @@ def links2subgraphs(A, graphs, params, max_label_value=None, semantic_embeddings
         extraction_time = time.time() - extraction_start
         total_gb = total_bytes / (1024**3)
         logging.info(f"Extraction + streaming completed in {extraction_time:.1f}s ({total_written:,} subgraphs)")
-        logging.info(f"Total data: {total_gb:.2f} GB ({total_bytes/total_written:.0f} bytes/subgraph)")
-        logging.info(f"Throughput: {total_written/extraction_time:.0f} items/sec (streaming mode)")
+        if total_written > 0:
+            logging.info(f"Total data: {total_gb:.2f} GB ({total_bytes/total_written:.0f} bytes/subgraph)")
+            logging.info(f"Throughput: {total_written/extraction_time:.0f} items/sec (streaming mode)")
 
     for split_name, split in graphs.items():
         # FIX #2: SHUFFLE DATA - Prevents high-degree entity clustering!
@@ -473,19 +629,22 @@ def links2subgraphs(A, graphs, params, max_label_value=None, semantic_embeddings
         split_env = env.open_db(db_name_pos.encode())
         extraction_helper(A, pos_links_shuffled, pos_labels_shuffled, split_env)
 
-        logging.info(f"Extracting enclosing subgraphs for negative links in {split_name} set")
         neg_links = split['neg']
-        neg_labels = np.zeros(len(neg_links))
+        if len(neg_links) > 0:
+            logging.info(f"Extracting enclosing subgraphs for negative links in {split_name} set")
+            neg_labels = np.zeros(len(neg_links))
 
-        # Shuffle negative links too
-        shuffle_idx = np.random.permutation(len(neg_links))
-        neg_links_shuffled = neg_links[shuffle_idx]
-        neg_labels_shuffled = neg_labels[shuffle_idx]
-        logging.info(f"  Shuffled {len(neg_links):,} negative links for balanced workload")
+            # Shuffle negative links too
+            shuffle_idx = np.random.permutation(len(neg_links))
+            neg_links_shuffled = neg_links[shuffle_idx]
+            neg_labels_shuffled = neg_labels[shuffle_idx]
+            logging.info(f"  Shuffled {len(neg_links):,} negative links for balanced workload")
 
-        db_name_neg = split_name + '_neg'
-        split_env = env.open_db(db_name_neg.encode())
-        extraction_helper(A, neg_links_shuffled, neg_labels_shuffled, split_env)
+            db_name_neg = split_name + '_neg'
+            split_env = env.open_db(db_name_neg.encode())
+            extraction_helper(A, neg_links_shuffled, neg_labels_shuffled, split_env)
+        else:
+            logging.info(f"No negative links for {split_name} set, skipping...")
 
     max_n_label['value'] = max_label_value if max_label_value is not None else max_n_label['value']
 

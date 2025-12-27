@@ -18,21 +18,38 @@ from .graph_sampler import *
 
 def process_sampling_task(task):
     """Process a single sampling task - defined at module level for pickle compatibility"""
-    from .graph_sampler import sample_fair_neg
+    from .graph_sampler import sample_fair_neg, sample_mixed_neg
     import traceback
 
     try:
         logging.info(f"Starting sampling for {task['split_name']} ({len(task['triplets']):,} triplets)")
         start_time = time.time()
 
-        pos, neg = sample_fair_neg(
-            task['adj_list'],
-            task['triplets'],
-            task['data_dir'],
-            task['num_neg_samples_per_link'],
-            max_size=task['max_size'],
-            constrained_neg_prob=task['constrained_neg_prob']
-        )
+        # Check if hard_negative_ratio is specified (for mixed sampling)
+        hard_negative_ratio = task.get('hard_negative_ratio', 0.0)
+
+        if hard_negative_ratio > 0:
+            # Use MIXED sampling: combination of hard (same type) and random negatives
+            logging.info(f"Using MIXED negative sampling ({hard_negative_ratio*100:.0f}% hard)")
+            pos, neg = sample_mixed_neg(
+                task['adj_list'],
+                task['triplets'],
+                task['data_dir'],
+                task['num_neg_samples_per_link'],
+                max_size=task['max_size'],
+                hard_negative_ratio=hard_negative_ratio,
+                constrained_neg_prob=task['constrained_neg_prob']
+            )
+        else:
+            # Use FAIR sampling (original: all same type)
+            pos, neg = sample_fair_neg(
+                task['adj_list'],
+                task['triplets'],
+                task['data_dir'],
+                task['num_neg_samples_per_link'],
+                max_size=task['max_size'],
+                constrained_neg_prob=task['constrained_neg_prob']
+            )
 
         elapsed = time.time() - start_time
         logging.info(f"Completed {task['split_name']} sampling in {elapsed:.1f}s ({len(neg):,} negatives)")
@@ -68,6 +85,13 @@ def generate_subgraph_datasets(params, splits=['train', 'valid'], saved_relation
     logging.info("Starting ULTRA-FAST parallel negative sampling with 8 cores...")
 
     # Prepare data for parallel processing
+    # Get hard_negative_ratio from params (default 0 = use fair sampling)
+    hard_negative_ratio = getattr(params, 'hard_negative_ratio', 0.0)
+    if hard_negative_ratio > 0:
+        logging.info(f"Hard negative ratio: {hard_negative_ratio*100:.0f}% (mixed sampling)")
+    else:
+        logging.info("Hard negative ratio: 0% (using fair sampling - all same type)")
+
     sampling_tasks = []
     for split_name, split in graphs.items():
         sampling_tasks.append({
@@ -77,7 +101,8 @@ def generate_subgraph_datasets(params, splits=['train', 'valid'], saved_relation
             'data_dir': data_dir,
             'num_neg_samples_per_link': params.num_neg_samples_per_link,
             'max_size': split['max_size'],
-            'constrained_neg_prob': params.constrained_neg_prob
+            'constrained_neg_prob': params.constrained_neg_prob,
+            'hard_negative_ratio': hard_negative_ratio  # NEW: for mixed sampling
         })
 
     # Process all splits in parallel with 8 cores
@@ -238,6 +263,9 @@ class SubgraphDataset(Dataset):
         with self.main_env.begin(db=self.db_pos) as txn:
             str_id = '{:08}'.format(index).encode('ascii')
             data_pos = deserialize(txn.get(str_id))
+            # Skip if positive sample is missing
+            if data_pos is None:
+                return None
             nodes_pos, r_label_pos, g_label_pos, n_labels_pos = data_pos['nodes'], data_pos['r_label'], data_pos['g_label'], data_pos['n_label']
             subgraph_pos = self._prepare_subgraphs(nodes_pos, r_label_pos, n_labels_pos)
         subgraphs_neg = []
@@ -247,6 +275,10 @@ class SubgraphDataset(Dataset):
             for i in range(self.num_neg_samples_per_link):
                 str_id = '{:08}'.format(index + i * (self.num_graphs_pos)).encode('ascii')
                 data_neg = deserialize(txn.get(str_id))
+                # If ANY negative sample is missing, skip the entire sample
+                # This ensures batch consistency (each positive has same number of negatives)
+                if data_neg is None:
+                    return None
                 nodes_neg, r_label_neg, g_label_neg, n_labels_neg = data_neg['nodes'], data_neg['r_label'], data_neg['g_label'], data_neg['n_label']
                 subgraphs_neg.append(self._prepare_subgraphs(nodes_neg, r_label_neg, n_labels_neg))
                 r_labels_neg.append(r_label_neg)
