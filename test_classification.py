@@ -213,68 +213,98 @@ class KGEScorer:
 
 
 def evaluate_grail(model, dataset, device, max_samples=None, batch_size=64):
-    """Evaluate GRAIL model on classification task"""
+    """Evaluate GRAIL model on classification task - MEMORY EFFICIENT VERSION"""
+    import gc
 
     logging.info("\n" + "="*60)
-    logging.info("Evaluating GRAIL (Subgraph-based)")
+    logging.info("Evaluating GRAIL (Subgraph-based) - Memory Efficient")
     logging.info("="*60)
 
     model.eval()
 
     all_scores = []
     all_labels = []
-    all_triplets = []  # For KGE comparison
+    all_triplets = []
 
     num_pos = min(dataset.num_pos, max_samples // 2) if max_samples else dataset.num_pos
     num_neg = min(dataset.num_neg, max_samples // 2) if max_samples else dataset.num_neg
 
     logging.info(f"Evaluating {num_pos:,} positive, {num_neg:,} negative samples")
+    logging.info(f"Using streaming batch processing (batch_size={batch_size})")
 
-    # Collect positive samples
-    logging.info("Processing positive samples...")
-    pos_graphs = []
-    pos_labels = []
-    pos_triplets = []
-
-    for idx in tqdm(range(num_pos), desc="Loading positives"):
-        subgraph, r_label, head, tail = dataset.get_sample(idx, is_positive=True)
-        if subgraph is not None:
-            pos_graphs.append(subgraph)
-            pos_labels.append(r_label)
-            pos_triplets.append((head, r_label, tail))
-
-    # Collect negative samples
-    logging.info("Processing negative samples...")
-    neg_graphs = []
-    neg_labels = []
-    neg_triplets = []
-
-    for idx in tqdm(range(num_neg), desc="Loading negatives"):
-        subgraph, r_label, head, tail = dataset.get_sample(idx, is_positive=False)
-        if subgraph is not None:
-            neg_graphs.append(subgraph)
-            neg_labels.append(r_label)
-            neg_triplets.append((head, r_label, tail))
-
-    # Score in batches
-    logging.info("Scoring with GRAIL model...")
-
-    def score_batch(graphs, labels):
+    def process_samples_streaming(num_samples, is_positive, desc):
+        """Process samples in streaming batches to save memory"""
         scores = []
-        for i in tqdm(range(0, len(graphs), batch_size), desc="Batching", leave=False):
-            batch_graphs = graphs[i:i+batch_size]
-            batch_labels = labels[i:i+batch_size]
+        triplets = []
 
-            batched = dgl.batch(batch_graphs).to(device)
-            labels_tensor = torch.tensor(batch_labels, dtype=torch.long, device=device)
+        batch_graphs = []
+        batch_labels = []
+        batch_triplets = []
 
-            with torch.no_grad():
-                batch_scores = model((batched, labels_tensor)).squeeze(-1).cpu().tolist()
-            scores.extend(batch_scores)
-        return scores
+        pbar = tqdm(range(num_samples), desc=desc)
+        for idx in pbar:
+            try:
+                subgraph, r_label, head, tail = dataset.get_sample(idx, is_positive=is_positive)
+                if subgraph is not None:
+                    batch_graphs.append(subgraph)
+                    batch_labels.append(r_label)
+                    batch_triplets.append((head, r_label, tail))
+            except Exception as e:
+                continue
 
-    pos_scores = score_batch(pos_graphs, pos_labels)
-    neg_scores = score_batch(neg_graphs, neg_labels)
+            # Process batch when full
+            if len(batch_graphs) >= batch_size:
+                try:
+                    batched = dgl.batch(batch_graphs).to(device)
+                    labels_tensor = torch.tensor(batch_labels, dtype=torch.long, device=device)
+
+                    with torch.no_grad():
+                        batch_scores = model((batched, labels_tensor)).squeeze(-1).cpu().tolist()
+
+                    scores.extend(batch_scores)
+                    triplets.extend(batch_triplets)
+
+                    # Clear memory
+                    del batched, labels_tensor, batch_scores
+                    torch.cuda.empty_cache()
+                except Exception as e:
+                    logging.warning(f"Batch error: {e}")
+
+                # Reset batch
+                batch_graphs = []
+                batch_labels = []
+                batch_triplets = []
+                gc.collect()
+
+        # Process remaining samples
+        if batch_graphs:
+            try:
+                batched = dgl.batch(batch_graphs).to(device)
+                labels_tensor = torch.tensor(batch_labels, dtype=torch.long, device=device)
+
+                with torch.no_grad():
+                    batch_scores = model((batched, labels_tensor)).squeeze(-1).cpu().tolist()
+
+                scores.extend(batch_scores)
+                triplets.extend(batch_triplets)
+
+                del batched, labels_tensor
+                torch.cuda.empty_cache()
+            except Exception as e:
+                logging.warning(f"Final batch error: {e}")
+
+        gc.collect()
+        return scores, triplets
+
+    # Process positives
+    logging.info("Processing positive samples (streaming)...")
+    pos_scores, pos_triplets = process_samples_streaming(num_pos, True, "Positives")
+    logging.info(f"  Scored {len(pos_scores):,} positives")
+
+    # Process negatives
+    logging.info("Processing negative samples (streaming)...")
+    neg_scores, neg_triplets = process_samples_streaming(num_neg, False, "Negatives")
+    logging.info(f"  Scored {len(neg_scores):,} negatives")
 
     all_scores = pos_scores + neg_scores
     all_labels = [1] * len(pos_scores) + [0] * len(neg_scores)
